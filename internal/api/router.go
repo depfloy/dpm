@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/depfloy/dpm/internal/health"
+	dpmlog "github.com/depfloy/dpm/internal/log"
 	"github.com/depfloy/dpm/internal/nginx"
 	"github.com/depfloy/dpm/internal/port"
 	"github.com/depfloy/dpm/internal/process"
@@ -378,7 +379,14 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if format == "json" {
-		r.successResponse(w, allLines)
+		// Parse each line into structured log entry
+		engine := dpmlog.NewEngine(r.config.Logging.Dir)
+		var entries []dpmlog.Entry
+		for _, line := range allLines {
+			entry := engine.ParseLine(line, name)
+			entries = append(entries, entry)
+		}
+		r.successResponse(w, entries)
 	} else {
 		w.Header().Set("Content-Type", "text/plain")
 		for _, line := range allLines {

@@ -91,6 +91,11 @@ func (e *Engine) GetErrorLogs(appName string, lines int) ([]Entry, error) {
 	return e.GetLogs(appName, Filter{Level: "error", Lines: lines})
 }
 
+// ParseLine parses a single log line into a structured Entry.
+func (e *Engine) ParseLine(line, appName string) Entry {
+	return parseLine(line, appName)
+}
+
 // LogDir returns the log directory for an app.
 func (e *Engine) LogDir(appName string) string {
 	return filepath.Join(e.baseDir, "apps", appName)
