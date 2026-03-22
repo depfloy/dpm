@@ -22,7 +22,7 @@ jobs:
         run: go test -v -race ./...
 
       - name: Build binaries
-        run: make build-linux VERSION=${{ github.ref_name }}
+        run: make build-linux VERSION=${GITHUB_REF_NAME#v}
 
       - name: Generate checksums
         run: make checksums

@@ -15,10 +15,10 @@ import (
 	"time"
 )
 
-const (
-	defaultSocket = "/var/run/dpm/dpm.sock"
-	version       = "dev"
-)
+const defaultSocket = "/var/run/dpm/dpm.sock"
+
+// version is set at build time via ldflags.
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
