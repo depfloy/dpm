@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	"gopkg.in/yaml.v3"
 )
@@ -77,6 +78,10 @@ type ProcessConfig struct {
 	Instances int    `yaml:"instances,omitempty" json:"instances,omitempty"`
 	Port      string `yaml:"port,omitempty" json:"port,omitempty"` // "auto" or specific port number
 
+	// Cluster mode: "auto" uses CPU cores, "fixed" uses Instances count.
+	// When set, all workers are active (no backup). Empty = legacy 2-instance mode.
+	Cluster *ClusterConfig `yaml:"cluster,omitempty" json:"cluster,omitempty"`
+
 	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 
 	HealthCheck *HealthCheckConfig `yaml:"health_check,omitempty" json:"health_check,omitempty"`
@@ -92,6 +97,14 @@ type ProcessConfig struct {
 	Nginx *ProcessNginxConfig `yaml:"nginx,omitempty" json:"nginx,omitempty"`
 
 	Workers []WorkerConfig `yaml:"workers,omitempty" json:"workers,omitempty"`
+}
+
+// ClusterConfig defines multi-worker cluster settings.
+type ClusterConfig struct {
+	Mode         string `yaml:"mode" json:"mode"`                                       // auto | fixed
+	Workers      int    `yaml:"workers,omitempty" json:"workers,omitempty"`              // Fixed worker count (used when mode=fixed)
+	DrainTimeout string `yaml:"drain_timeout,omitempty" json:"drain_timeout,omitempty"`  // e.g. "30s" - time to wait for active requests during shutdown
+	Strategy     string `yaml:"strategy,omitempty" json:"strategy,omitempty"`            // least_conn | round_robin | ip_hash
 }
 
 // HealthCheckConfig defines health check settings for a process.
@@ -155,6 +168,59 @@ func DefaultDaemonConfig() *DaemonConfig {
 	cfg.HealthCheck.Retries = 3
 	cfg.State.Dir = "/var/lib/dpm"
 	return cfg
+}
+
+// IsClusterMode returns true if cluster mode is enabled.
+func (c *ProcessConfig) IsClusterMode() bool {
+	return c.Cluster != nil && c.Cluster.Mode != ""
+}
+
+// ResolveWorkerCount returns the number of workers to start.
+// In cluster mode: auto = CPU cores - 1 (min 2), fixed = specified count.
+// Without cluster: uses Instances field (default 1).
+func (c *ProcessConfig) ResolveWorkerCount() int {
+	if !c.IsClusterMode() {
+		if c.Instances <= 0 {
+			return 1
+		}
+		return c.Instances
+	}
+
+	switch c.Cluster.Mode {
+	case "auto":
+		cores := runtime.NumCPU()
+		workers := cores - 1
+		if workers < 2 {
+			workers = 2
+		}
+		return workers
+	case "fixed":
+		if c.Cluster.Workers <= 0 {
+			return 2
+		}
+		return c.Cluster.Workers
+	default:
+		return 2
+	}
+}
+
+// UpstreamStrategy returns the nginx upstream strategy for this process.
+func (c *ProcessConfig) UpstreamStrategy() string {
+	if c.Cluster != nil && c.Cluster.Strategy != "" {
+		return c.Cluster.Strategy
+	}
+	if c.IsClusterMode() {
+		return "least_conn"
+	}
+	return ""
+}
+
+// DrainTimeout returns the connection drain timeout duration string.
+func (c *ProcessConfig) DrainTimeout() string {
+	if c.Cluster != nil && c.Cluster.DrainTimeout != "" {
+		return c.Cluster.DrainTimeout
+	}
+	return "30s"
 }
 
 // LoadDaemonConfig reads and parses a YAML config file, applying defaults for missing values.

@@ -78,14 +78,13 @@ func (m *Manager) OnStatusChange(fn func(name, status string)) {
 }
 
 // Start launches a new process based on the given config.
-// For multi-instance configs, it starts each instance on its own port.
+// For cluster mode, starts workers based on CPU cores.
+// For legacy mode, starts based on Instances count.
 func (m *Manager) Start(cfg *config.ProcessConfig, ports []int) error {
-	if cfg.Instances <= 0 {
-		cfg.Instances = 1
-	}
+	workerCount := cfg.ResolveWorkerCount()
 
-	for i := 0; i < cfg.Instances; i++ {
-		key := instanceKey(cfg.Name, i, cfg.Instances)
+	for i := 0; i < workerCount; i++ {
+		key := instanceKey(cfg.Name, i, workerCount)
 		port := 0
 		if i < len(ports) {
 			port = ports[i]
