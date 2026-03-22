@@ -42,6 +42,8 @@ func main() {
 		cmdList()
 	case "info":
 		cmdInfo(args)
+	case "logs":
+		cmdLogs(args)
 	case "status":
 		cmdStatus()
 	case "health":
@@ -177,6 +179,46 @@ func cmdInfo(args []string) {
 	name := requireArg(args, "Usage: dpm info <name>")
 	body := apiGet(fmt.Sprintf("/api/v1/processes/%s", name))
 	printFormattedJSON(body)
+}
+
+func cmdLogs(args []string) {
+	name := ""
+	lines := "100"
+	level := ""
+	isJSON := false
+
+	for _, a := range args {
+		switch {
+		case strings.HasPrefix(a, "--lines="):
+			lines = strings.TrimPrefix(a, "--lines=")
+		case strings.HasPrefix(a, "--level="):
+			level = strings.TrimPrefix(a, "--level=")
+		case a == "--json":
+			isJSON = true
+		case !strings.HasPrefix(a, "-"):
+			name = a
+		}
+	}
+
+	if name == "" {
+		fatal("Usage: dpm logs <name> [--lines=100] [--level=error] [--json]")
+	}
+
+	query := fmt.Sprintf("?lines=%s", lines)
+	if level != "" {
+		query += "&level=" + level
+	}
+	if isJSON {
+		query += "&format=json"
+	}
+
+	body := apiGet(fmt.Sprintf("/api/v1/logs/%s%s", name, query))
+
+	if isJSON {
+		printFormattedJSON(body)
+	} else {
+		fmt.Print(string(body))
+	}
 }
 
 func cmdStatus() {

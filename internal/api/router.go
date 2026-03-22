@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -66,6 +69,9 @@ func NewRouter(
 	// Port endpoints
 	mux.HandleFunc("/api/v1/ports", r.handlePorts)
 	mux.HandleFunc("/api/v1/ports/allocate", r.handlePortAllocate)
+
+	// Log endpoints
+	mux.HandleFunc("/api/v1/logs/", r.handleLogs)
 
 	// System endpoints
 	mux.HandleFunc("/api/v1/status", r.handleStatus)
@@ -303,6 +309,94 @@ func (r *Router) handlePortAllocate(w http.ResponseWriter, req *http.Request) {
 	}
 
 	r.successResponse(w, map[string]interface{}{"ports": ports})
+}
+
+// --- Log Handlers ---
+
+func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		r.methodNotAllowed(w)
+		return
+	}
+
+	name := strings.TrimPrefix(req.URL.Path, "/api/v1/logs/")
+	if name == "" {
+		r.errorResponse(w, http.StatusBadRequest, "process name required")
+		return
+	}
+
+	lines := 100
+	if v := req.URL.Query().Get("lines"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			lines = n
+		}
+	}
+
+	level := req.URL.Query().Get("level")
+	format := req.URL.Query().Get("format") // "json" or empty for plain text
+
+	// Read log files
+	logDir := filepath.Join(r.config.Logging.Dir, "apps", name)
+	var allLines []string
+
+	// Read main log + instance logs
+	logFiles := []string{"current.log", "instance-1.log", "instance-2.log", "instance-3.log"}
+	if level == "error" {
+		logFiles = []string{"error.log", "instance-1.error.log", "instance-2.error.log", "instance-3.error.log"}
+	}
+
+	for _, f := range logFiles {
+		path := filepath.Join(logDir, f)
+		fileLines := readLastLines(path, lines)
+		allLines = append(allLines, fileLines...)
+	}
+
+	// Also include error logs if not filtering by level
+	if level == "" {
+		errorFiles := []string{"error.log", "instance-1.error.log", "instance-2.error.log", "instance-3.error.log"}
+		for _, f := range errorFiles {
+			path := filepath.Join(logDir, f)
+			fileLines := readLastLines(path, lines)
+			allLines = append(allLines, fileLines...)
+		}
+	}
+
+	// Limit total
+	if len(allLines) > lines {
+		allLines = allLines[len(allLines)-lines:]
+	}
+
+	if format == "json" {
+		r.successResponse(w, allLines)
+	} else {
+		w.Header().Set("Content-Type", "text/plain")
+		for _, line := range allLines {
+			fmt.Fprintln(w, line)
+		}
+	}
+}
+
+func readLastLines(path string, n int) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines
 }
 
 // --- System Handlers ---
