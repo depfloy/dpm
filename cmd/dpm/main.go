@@ -423,13 +423,17 @@ func formatDuration(d time.Duration) string {
 	hours := int(d.Hours()) % 24
 	mins := int(d.Minutes()) % 60
 
+	secs := int(d.Seconds()) % 60
+
 	switch {
 	case days > 0:
 		return fmt.Sprintf("%dd %dh", days, hours)
 	case hours > 0:
 		return fmt.Sprintf("%dh %dm", hours, mins)
+	case mins > 0:
+		return fmt.Sprintf("%dm %ds", mins, secs)
 	default:
-		return fmt.Sprintf("%dm", mins)
+		return fmt.Sprintf("%ds", secs)
 	}
 }
 
