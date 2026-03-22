@@ -78,53 +78,79 @@ func Perform(currentVersion, targetVersion, channel string, force bool) *Result 
 	}
 
 	arch := runtime.GOARCH
-	binaryName := fmt.Sprintf("dpm-linux-%s", arch)
+	cliBinaryName := fmt.Sprintf("dpm-linux-%s", arch)
+	daemonBinaryName := fmt.Sprintf("dpmd-linux-%s", arch)
 
-	// 1. Download new binary
-	binaryURL := fmt.Sprintf("%s/v%s/%s", baseURL, targetVersion, binaryName)
-	tmpPath := "/usr/local/bin/dpm.new"
+	// 1. Download new binaries
+	cliURL := fmt.Sprintf("%s/v%s/%s", baseURL, targetVersion, cliBinaryName)
+	daemonURL := fmt.Sprintf("%s/v%s/%s", baseURL, targetVersion, daemonBinaryName)
+	cliTmpPath := "/usr/local/bin/dpm.new"
+	daemonTmpPath := "/usr/local/bin/dpmd.new"
 
-	if err := downloadFile(tmpPath, binaryURL); err != nil {
+	if err := downloadFile(cliTmpPath, cliURL); err != nil {
 		result.Status = "failed"
-		result.Error = fmt.Sprintf("download failed: %v", err)
+		result.Error = fmt.Sprintf("CLI download failed: %v", err)
 		return result
 	}
 
-	// 2. Download and verify checksum
-	checksumURL := fmt.Sprintf("%s/v%s/checksums.txt", baseURL, targetVersion)
-	if err := verifyChecksum(tmpPath, checksumURL, binaryName); err != nil {
-		os.Remove(tmpPath)
+	if err := downloadFile(daemonTmpPath, daemonURL); err != nil {
+		os.Remove(cliTmpPath)
 		result.Status = "failed"
-		result.Error = fmt.Sprintf("checksum verification failed: %v", err)
+		result.Error = fmt.Sprintf("daemon download failed: %v", err)
+		return result
+	}
+
+	// 2. Download and verify checksums
+	checksumURL := fmt.Sprintf("%s/v%s/checksums.txt", baseURL, targetVersion)
+	if err := verifyChecksum(cliTmpPath, checksumURL, cliBinaryName); err != nil {
+		os.Remove(cliTmpPath)
+		os.Remove(daemonTmpPath)
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("CLI checksum verification failed: %v", err)
+		return result
+	}
+
+	if err := verifyChecksum(daemonTmpPath, checksumURL, daemonBinaryName); err != nil {
+		os.Remove(cliTmpPath)
+		os.Remove(daemonTmpPath)
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("daemon checksum verification failed: %v", err)
 		return result
 	}
 
 	// 3. Make executable
-	os.Chmod(tmpPath, 0755)
+	os.Chmod(cliTmpPath, 0755)
+	os.Chmod(daemonTmpPath, 0755)
 
 	// 4. Backup current binaries
 	os.Rename("/usr/local/bin/dpm", "/usr/local/bin/dpm.bak")
+	os.Rename("/usr/local/bin/dpmd", "/usr/local/bin/dpmd.bak")
 
 	// 5. Atomic swap
-	if err := os.Rename(tmpPath, "/usr/local/bin/dpm"); err != nil {
+	if err := os.Rename(cliTmpPath, "/usr/local/bin/dpm"); err != nil {
 		// Rollback
 		os.Rename("/usr/local/bin/dpm.bak", "/usr/local/bin/dpm")
+		os.Rename("/usr/local/bin/dpmd.bak", "/usr/local/bin/dpmd")
 		result.Status = "failed"
-		result.Error = fmt.Sprintf("binary swap failed: %v", err)
+		result.Error = fmt.Sprintf("CLI binary swap failed: %v", err)
 		return result
 	}
 
-	// Update daemon symlink
-	os.Remove("/usr/local/bin/dpmd")
-	os.Symlink("/usr/local/bin/dpm", "/usr/local/bin/dpmd")
+	if err := os.Rename(daemonTmpPath, "/usr/local/bin/dpmd"); err != nil {
+		// Rollback
+		os.Rename("/usr/local/bin/dpm.bak", "/usr/local/bin/dpm")
+		os.Rename("/usr/local/bin/dpmd.bak", "/usr/local/bin/dpmd")
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("daemon binary swap failed: %v", err)
+		return result
+	}
 
 	// 6. Restart daemon via systemd
 	cmd := exec.Command("systemctl", "restart", "dpm")
 	if err := cmd.Run(); err != nil {
 		// Rollback
 		os.Rename("/usr/local/bin/dpm.bak", "/usr/local/bin/dpm")
-		os.Remove("/usr/local/bin/dpmd")
-		os.Symlink("/usr/local/bin/dpm", "/usr/local/bin/dpmd")
+		os.Rename("/usr/local/bin/dpmd.bak", "/usr/local/bin/dpmd")
 		exec.Command("systemctl", "restart", "dpm").Run()
 
 		result.Status = "failed"
@@ -138,7 +164,7 @@ func Perform(currentVersion, targetVersion, channel string, force bool) *Result 
 	return result
 }
 
-// Rollback reverts to the previous DPM binary.
+// Rollback reverts to the previous DPM binaries.
 func Rollback() *Result {
 	result := &Result{}
 
@@ -149,8 +175,9 @@ func Rollback() *Result {
 	}
 
 	os.Rename("/usr/local/bin/dpm.bak", "/usr/local/bin/dpm")
-	os.Remove("/usr/local/bin/dpmd")
-	os.Symlink("/usr/local/bin/dpm", "/usr/local/bin/dpmd")
+	if _, err := os.Stat("/usr/local/bin/dpmd.bak"); err == nil {
+		os.Rename("/usr/local/bin/dpmd.bak", "/usr/local/bin/dpmd")
+	}
 
 	cmd := exec.Command("systemctl", "restart", "dpm")
 	if err := cmd.Run(); err != nil {

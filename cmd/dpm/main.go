@@ -266,8 +266,9 @@ func cmdUpgrade(args []string) {
 				fatal("No backup binary found")
 			}
 			os.Rename("/usr/local/bin/dpm.bak", "/usr/local/bin/dpm")
-			os.Remove("/usr/local/bin/dpmd")
-			os.Symlink("/usr/local/bin/dpm", "/usr/local/bin/dpmd")
+			if _, err := os.Stat("/usr/local/bin/dpmd.bak"); err == nil {
+				os.Rename("/usr/local/bin/dpmd.bak", "/usr/local/bin/dpmd")
+			}
 			out, _ := exec.Command("systemctl", "restart", "dpm").CombinedOutput()
 			fmt.Println(string(out))
 			fmt.Println("Rollback complete")

@@ -61,42 +61,59 @@ fi
 
 echo "==> Installing DPM v$VERSION"
 
-# Download binary
-BINARY_URL="$BASE_URL/v$VERSION/dpm-$OS-$ARCH"
+# Download binaries
+CLI_URL="$BASE_URL/v$VERSION/dpm-$OS-$ARCH"
+DAEMON_URL="$BASE_URL/v$VERSION/dpmd-$OS-$ARCH"
 CHECKSUM_URL="$BASE_URL/v$VERSION/checksums.txt"
 
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT
 
-echo "==> Downloading binary..."
-curl -fsSL -o "$TMP_DIR/dpm" "$BINARY_URL"
+echo "==> Downloading CLI binary..."
+curl -fsSL -o "$TMP_DIR/dpm" "$CLI_URL"
+
+echo "==> Downloading daemon binary..."
+curl -fsSL -o "$TMP_DIR/dpmd" "$DAEMON_URL"
 
 echo "==> Downloading checksums..."
 curl -fsSL -o "$TMP_DIR/checksums.txt" "$CHECKSUM_URL"
 
-# Verify checksum
-echo "==> Verifying checksum..."
-EXPECTED=$(grep "dpm-$OS-$ARCH" "$TMP_DIR/checksums.txt" | awk '{print $1}')
-ACTUAL=$(sha256sum "$TMP_DIR/dpm" | awk '{print $1}')
+# Verify checksums
+echo "==> Verifying checksums..."
+EXPECTED_CLI=$(grep "dpm-$OS-$ARCH" "$TMP_DIR/checksums.txt" | head -1 | awk '{print $1}')
+ACTUAL_CLI=$(sha256sum "$TMP_DIR/dpm" | awk '{print $1}')
 
-if [ "$EXPECTED" != "$ACTUAL" ]; then
-    echo "Checksum verification failed!"
-    echo "  Expected: $EXPECTED"
-    echo "  Actual:   $ACTUAL"
+if [ "$EXPECTED_CLI" != "$ACTUAL_CLI" ]; then
+    echo "CLI checksum verification failed!"
+    echo "  Expected: $EXPECTED_CLI"
+    echo "  Actual:   $ACTUAL_CLI"
     exit 1
 fi
-echo "    Checksum OK"
+echo "    CLI checksum OK"
 
-# Install binary
-echo "==> Installing binary to $PREFIX/bin/"
+EXPECTED_DAEMON=$(grep "dpmd-$OS-$ARCH" "$TMP_DIR/checksums.txt" | head -1 | awk '{print $1}')
+ACTUAL_DAEMON=$(sha256sum "$TMP_DIR/dpmd" | awk '{print $1}')
+
+if [ "$EXPECTED_DAEMON" != "$ACTUAL_DAEMON" ]; then
+    echo "Daemon checksum verification failed!"
+    echo "  Expected: $EXPECTED_DAEMON"
+    echo "  Actual:   $ACTUAL_DAEMON"
+    exit 1
+fi
+echo "    Daemon checksum OK"
+
+# Install binaries
+echo "==> Installing binaries to $PREFIX/bin/"
 chmod +x "$TMP_DIR/dpm"
+chmod +x "$TMP_DIR/dpmd"
 
-# The same binary serves as both CLI and daemon based on how it's invoked
+# Atomic install: CLI binary
 cp "$TMP_DIR/dpm" "$PREFIX/bin/dpm.new"
 mv -f "$PREFIX/bin/dpm.new" "$PREFIX/bin/dpm"
 
-# Create symlink for daemon
-ln -sf "$PREFIX/bin/dpm" "$PREFIX/bin/dpmd"
+# Atomic install: Daemon binary
+cp "$TMP_DIR/dpmd" "$PREFIX/bin/dpmd.new"
+mv -f "$PREFIX/bin/dpmd.new" "$PREFIX/bin/dpmd"
 
 # Create directories
 echo "==> Creating directories..."
