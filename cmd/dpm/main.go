@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -47,6 +48,8 @@ func main() {
 		cmdHealth(args)
 	case "port":
 		cmdPort(args)
+	case "upgrade":
+		cmdUpgrade(args)
 	case "version":
 		cmdVersion()
 	case "help", "--help", "-h":
@@ -251,7 +254,52 @@ func cmdPort(args []string) {
 	}
 }
 
+func cmdUpgrade(args []string) {
+	targetVersion := ""
+	for _, a := range args {
+		if strings.HasPrefix(a, "--version=") {
+			targetVersion = strings.TrimPrefix(a, "--version=")
+		}
+		if a == "--rollback" {
+			fmt.Println("Rolling back to previous version...")
+			if _, err := os.Stat("/usr/local/bin/dpm.bak"); os.IsNotExist(err) {
+				fatal("No backup binary found")
+			}
+			os.Rename("/usr/local/bin/dpm.bak", "/usr/local/bin/dpm")
+			os.Remove("/usr/local/bin/dpmd")
+			os.Symlink("/usr/local/bin/dpm", "/usr/local/bin/dpmd")
+			out, _ := exec.Command("systemctl", "restart", "dpm").CombinedOutput()
+			fmt.Println(string(out))
+			fmt.Println("Rollback complete")
+			return
+		}
+	}
+
+	if targetVersion == "" {
+		fatal("Usage: dpm upgrade --version=<version>")
+	}
+
+	fmt.Printf("Upgrading DPM to v%s...\n", targetVersion)
+
+	// Use install script for upgrade (handles download, checksum, atomic swap, restart)
+	cmd := exec.Command("bash", "-c",
+		fmt.Sprintf("curl -fsSL https://get.depfloy.com/dpm/install.sh | bash -s -- --version=%s", targetVersion))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fatal("Upgrade failed: %v", err)
+	}
+}
+
 func cmdVersion() {
+	// --short flag: print only version number (no prefix, no daemon check)
+	for _, a := range os.Args[2:] {
+		if a == "--short" {
+			fmt.Print(version)
+			return
+		}
+	}
+
 	fmt.Printf("DPM v%s\n", version)
 
 	// Check for updates
