@@ -12,6 +12,7 @@ import (
 
 	"github.com/depfloy/dpm/internal/api"
 	"github.com/depfloy/dpm/internal/health"
+	"github.com/depfloy/dpm/internal/nginx"
 	"github.com/depfloy/dpm/internal/port"
 	"github.com/depfloy/dpm/internal/process"
 	"github.com/depfloy/dpm/internal/state"
@@ -26,8 +27,9 @@ type Daemon struct {
 	config       *config.DaemonConfig
 	store        *state.Store
 	processManager *process.Manager
-	portManager  *port.Manager
-	healthChecker *health.Checker
+	portManager    *port.Manager
+	healthChecker  *health.Checker
+	nginxManager   *nginx.Manager
 	apiServer    *http.Server
 	listener     net.Listener
 	logger       *slog.Logger
@@ -57,6 +59,7 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 	pm := process.NewManager(store, cfg.Logging.Dir)
 	portMgr := port.NewManager(store, cfg.Ports)
 	hc := health.NewChecker()
+	nginxMgr := nginx.NewManager(cfg.Nginx.ConfigDir, cfg.Nginx.ReloadCommand, pm)
 
 	// Wire up health check → process manager integration
 	hc.OnUnhealthy(func(name string, status *health.Status) {
@@ -77,6 +80,7 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 		processManager: pm,
 		portManager:    portMgr,
 		healthChecker:  hc,
+		nginxManager:   nginxMgr,
 		logger:         logger,
 		stopCh:         make(chan struct{}),
 	}
@@ -227,6 +231,7 @@ func (d *Daemon) startAPI() error {
 		d.processManager,
 		d.portManager,
 		d.healthChecker,
+		d.nginxManager,
 		d.store,
 		d.config,
 		d.logger,

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/depfloy/dpm/internal/health"
+	"github.com/depfloy/dpm/internal/nginx"
 	"github.com/depfloy/dpm/internal/port"
 	"github.com/depfloy/dpm/internal/process"
 	"github.com/depfloy/dpm/internal/state"
@@ -36,6 +37,7 @@ type Router struct {
 	pm      *process.Manager
 	ports   *port.Manager
 	health  *health.Checker
+	nginx   *nginx.Manager
 	store   *state.Store
 	config  *config.DaemonConfig
 	logger  *slog.Logger
@@ -47,6 +49,7 @@ func NewRouter(
 	pm *process.Manager,
 	ports *port.Manager,
 	hc *health.Checker,
+	nginxMgr *nginx.Manager,
 	store *state.Store,
 	cfg *config.DaemonConfig,
 	logger *slog.Logger,
@@ -54,6 +57,7 @@ func NewRouter(
 	r := &Router{
 		pm:     pm,
 		ports:  ports,
+		nginx:  nginxMgr,
 		health: hc,
 		store:  store,
 		config: cfg,
@@ -69,6 +73,13 @@ func NewRouter(
 	// Port endpoints
 	mux.HandleFunc("/api/v1/ports", r.handlePorts)
 	mux.HandleFunc("/api/v1/ports/allocate", r.handlePortAllocate)
+
+	// Nginx endpoints
+	mux.HandleFunc("/api/v1/nginx/apply", r.handleNginxApply)
+	mux.HandleFunc("/api/v1/nginx/remove/", r.handleNginxRemove)
+	mux.HandleFunc("/api/v1/nginx/show/", r.handleNginxShow)
+	mux.HandleFunc("/api/v1/nginx/test", r.handleNginxTest)
+	mux.HandleFunc("/api/v1/nginx/status", r.handleNginxStatus)
 
 	// Log endpoints
 	mux.HandleFunc("/api/v1/logs/", r.handleLogs)
@@ -397,6 +408,99 @@ func readLastLines(path string, n int) []string {
 		lines = lines[len(lines)-n:]
 	}
 	return lines
+}
+
+// --- Nginx Handlers ---
+
+func (r *Router) handleNginxApply(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		r.methodNotAllowed(w)
+		return
+	}
+
+	var applyReq nginx.ApplyRequest
+	if err := json.NewDecoder(req.Body).Decode(&applyReq); err != nil {
+		r.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", err))
+		return
+	}
+
+	result := r.nginx.Apply(&applyReq)
+	if result.Status == "error" {
+		r.errorResponse(w, http.StatusInternalServerError, result.Error)
+		return
+	}
+
+	r.logger.Info("nginx config applied", "domain", applyReq.PrimaryDomain, "workers", result.WorkersInUpstream)
+	r.successResponse(w, result)
+}
+
+func (r *Router) handleNginxRemove(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodDelete && req.Method != http.MethodPost {
+		r.methodNotAllowed(w)
+		return
+	}
+
+	domain := strings.TrimPrefix(req.URL.Path, "/api/v1/nginx/remove/")
+	if domain == "" {
+		r.errorResponse(w, http.StatusBadRequest, "domain required")
+		return
+	}
+
+	result := r.nginx.Remove(domain)
+	if result.Status == "error" {
+		r.errorResponse(w, http.StatusInternalServerError, result.Error)
+		return
+	}
+
+	r.logger.Info("nginx config removed", "domain", domain)
+	r.successResponse(w, result)
+}
+
+func (r *Router) handleNginxShow(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		r.methodNotAllowed(w)
+		return
+	}
+
+	domain := strings.TrimPrefix(req.URL.Path, "/api/v1/nginx/show/")
+	config, err := r.nginx.Show(domain)
+	if err != nil {
+		r.errorResponse(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprint(w, config)
+}
+
+func (r *Router) handleNginxTest(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet && req.Method != http.MethodPost {
+		r.methodNotAllowed(w)
+		return
+	}
+
+	output, err := r.nginx.Test()
+	status := "ok"
+	if err != nil {
+		status = "failed"
+	}
+
+	r.successResponse(w, map[string]string{"status": status, "output": output})
+}
+
+func (r *Router) handleNginxStatus(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		r.methodNotAllowed(w)
+		return
+	}
+
+	sites, err := r.nginx.Status()
+	if err != nil {
+		r.errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	r.successResponse(w, map[string]interface{}{"sites": sites, "count": len(sites)})
 }
 
 // --- System Handlers ---

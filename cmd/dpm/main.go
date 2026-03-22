@@ -50,6 +50,8 @@ func main() {
 		cmdHealth(args)
 	case "port":
 		cmdPort(args)
+	case "nginx":
+		cmdNginx(args)
 	case "upgrade":
 		cmdUpgrade(args)
 	case "version":
@@ -179,6 +181,52 @@ func cmdInfo(args []string) {
 	name := requireArg(args, "Usage: dpm info <name>")
 	body := apiGet(fmt.Sprintf("/api/v1/processes/%s", name))
 	printFormattedJSON(body)
+}
+
+func cmdNginx(args []string) {
+	if len(args) == 0 {
+		fatal("Usage: dpm nginx <apply|remove|show|test|status>")
+	}
+
+	switch args[0] {
+	case "apply":
+		configJSON := ""
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "--config=") {
+				configJSON = strings.TrimPrefix(a, "--config=")
+			}
+		}
+		if configJSON == "" {
+			fatal("Usage: dpm nginx apply --config='<json>'")
+		}
+		resp := apiPost("/api/v1/nginx/apply", []byte(configJSON))
+		printJSON(resp)
+
+	case "remove":
+		if len(args) < 2 {
+			fatal("Usage: dpm nginx remove <domain>")
+		}
+		resp := apiDelete(fmt.Sprintf("/api/v1/nginx/remove/%s", args[1]))
+		printJSON(resp)
+
+	case "show":
+		if len(args) < 2 {
+			fatal("Usage: dpm nginx show <domain>")
+		}
+		body := apiGet(fmt.Sprintf("/api/v1/nginx/show/%s", args[1]))
+		fmt.Print(string(body))
+
+	case "test":
+		body := apiGet("/api/v1/nginx/test")
+		printJSON(body)
+
+	case "status":
+		body := apiGet("/api/v1/nginx/status")
+		printFormattedJSON(body)
+
+	default:
+		fatal("Unknown nginx subcommand: %s", args[0])
+	}
 }
 
 func cmdLogs(args []string) {

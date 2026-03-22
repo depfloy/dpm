@@ -1,0 +1,10 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{REDIRECT_FROM}};
+    server_tokens off;
+
+    return 308 {{REDIRECT_SCHEME}}://{{REDIRECT_TO}}$request_uri;
+}
+
+{{REDIRECT_SSL_BLOCK}}
