@@ -220,8 +220,8 @@ func (d *Daemon) startAPI() error {
 		return fmt.Errorf("listen unix socket: %w", err)
 	}
 
-	// Set socket permissions so depfloy user can access
-	os.Chmod(d.config.Daemon.Socket, 0660)
+	// Set socket permissions so configured user can access
+	os.Chmod(d.config.Daemon.Socket, 0666)
 
 	handler := api.NewRouter(
 		d.processManager,
