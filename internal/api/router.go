@@ -140,10 +140,11 @@ func (r *Router) createProcess(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Allocate ports
+	// Allocate ports - use ResolveWorkerCount for cluster-aware count
+	workerCount := cfg.ResolveWorkerCount()
 	var ports []int
 	if cfg.Port == "auto" {
-		allocated, err := r.ports.Allocate(cfg.Name, cfg.Type, cfg.Instances)
+		allocated, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount)
 		if err != nil {
 			r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("port allocation failed: %v", err))
 			return
@@ -155,14 +156,11 @@ func (r *Router) createProcess(w http.ResponseWriter, req *http.Request) {
 			r.errorResponse(w, http.StatusBadRequest, "port must be 'auto' or a number")
 			return
 		}
-		if err := r.ports.AllocateSpecific(cfg.Name, cfg.Type, p); err != nil {
-			r.errorResponse(w, http.StatusConflict, fmt.Sprintf("port unavailable: %v", err))
-			return
-		}
+		// First port is the specified one
 		ports = []int{p}
-		// For multi-instance, allocate additional ports
-		if cfg.Instances > 1 {
-			additional, err := r.ports.Allocate(cfg.Name, cfg.Type, cfg.Instances-1)
+		// Allocate remaining ports for additional workers
+		if workerCount > 1 {
+			additional, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount-1)
 			if err != nil {
 				r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("additional port allocation failed: %v", err))
 				return
