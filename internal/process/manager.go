@@ -413,7 +413,6 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile *os.File) 
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Check restart policy
 	shouldRestart := false
@@ -436,6 +435,7 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile *os.File) 
 	if !shouldRestart {
 		proc.status = StatusStopped
 		m.persistProcess(proc, key)
+		m.mu.Unlock()
 		m.notifyStatusChange(key, StatusStopped)
 		return
 	}
@@ -448,10 +448,6 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile *os.File) 
 	m.mu.Unlock()
 
 	time.Sleep(delay)
-
-	m.mu.Lock()
-	// Re-start the instance (unlock/lock handled by caller pattern)
-	m.mu.Unlock()
 	m.startInstance(proc.config, key, proc.instance, proc.port)
 }
 
