@@ -130,13 +130,13 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 		Setpgid: true,
 	}
 
-	// Set up log files
+	// Set up log files with timestamp prefix writer
 	logFile, errFile, err := m.openLogFiles(cfg.Name, instance)
 	if err != nil {
 		return fmt.Errorf("open log files: %w", err)
 	}
-	cmd.Stdout = logFile
-	cmd.Stderr = errFile
+	cmd.Stdout = &timestampWriter{w: logFile}
+	cmd.Stderr = &timestampWriter{w: errFile}
 
 	// Start process
 	if err := cmd.Start(); err != nil {
@@ -638,4 +638,42 @@ func resolveTimeout(s string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// timestampWriter wraps an io.Writer and prepends ISO8601 timestamp to each line.
+type timestampWriter struct {
+	w   *os.File
+	buf []byte
+}
+
+func (tw *timestampWriter) Write(p []byte) (int, error) {
+	tw.buf = append(tw.buf, p...)
+
+	for {
+		idx := -1
+		for i, b := range tw.buf {
+			if b == '\n' {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			break
+		}
+
+		line := string(tw.buf[:idx])
+		tw.buf = tw.buf[idx+1:]
+
+		if line == "" {
+			continue
+		}
+
+		ts := time.Now().UTC().Format(time.RFC3339)
+		_, err := fmt.Fprintf(tw.w, "%s %s\n", ts, line)
+		if err != nil {
+			return len(p), err
+		}
+	}
+
+	return len(p), nil
 }

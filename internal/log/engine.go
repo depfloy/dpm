@@ -102,7 +102,7 @@ func (e *Engine) LogDir(appName string) string {
 }
 
 // parseLine attempts to parse a log line into a structured Entry.
-// Supports: JSON logs (pino/winston), Laravel logs, plain text.
+// Supports: DPM timestamp prefix, JSON logs (pino/winston), Laravel logs, plain text.
 func parseLine(line, appName string) Entry {
 	entry := Entry{
 		Timestamp: time.Now(),
@@ -110,6 +110,32 @@ func parseLine(line, appName string) Entry {
 		App:       appName,
 		Type:      "stdout",
 		Message:   line,
+	}
+
+	// Try DPM timestamp prefix: "2026-03-22T20:13:15Z message"
+	if len(line) > 20 && (line[4] == '-' && line[10] == 'T') {
+		tsStr := line[:20]
+		if t, err := time.Parse("2006-01-02T15:04:05Z", tsStr); err == nil {
+			entry.Timestamp = t
+			rest := strings.TrimSpace(line[20:])
+			if rest != "" {
+				entry.Message = rest
+				line = rest // Continue parsing the message part
+			}
+		} else if len(line) > 25 {
+			// Try RFC3339 with timezone offset
+			for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05-07:00"} {
+				if t, err := time.Parse(layout, line[:25]); err == nil {
+					entry.Timestamp = t
+					rest := strings.TrimSpace(line[25:])
+					if rest != "" {
+						entry.Message = rest
+						line = rest
+					}
+					break
+				}
+			}
+		}
 	}
 
 	// Try JSON parse first (pino, winston, bunyan, etc.)
