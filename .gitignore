@@ -1,0 +1,5 @@
+bin/
+*.db
+*.log
+*.bak
+.DS_Store

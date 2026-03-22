@@ -1,0 +1,291 @@
+package daemon
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/depfloy/dpm/internal/api"
+	"github.com/depfloy/dpm/internal/health"
+	"github.com/depfloy/dpm/internal/port"
+	"github.com/depfloy/dpm/internal/process"
+	"github.com/depfloy/dpm/internal/state"
+	"github.com/depfloy/dpm/pkg/config"
+)
+
+// Version is set at build time via ldflags.
+var Version = "dev"
+
+// Daemon is the main DPM daemon that manages all subsystems.
+type Daemon struct {
+	config       *config.DaemonConfig
+	store        *state.Store
+	processManager *process.Manager
+	portManager  *port.Manager
+	healthChecker *health.Checker
+	apiServer    *http.Server
+	listener     net.Listener
+	logger       *slog.Logger
+	stopCh       chan struct{}
+}
+
+// New creates a new daemon instance.
+func New(cfg *config.DaemonConfig) (*Daemon, error) {
+	// Initialize logger
+	logFile, err := os.OpenFile(cfg.Daemon.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		// Fall back to stderr
+		logFile = os.Stderr
+	}
+
+	logger := slog.New(slog.NewJSONHandler(logFile, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	// Open state store
+	store, err := state.Open(cfg.State.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("open state store: %w", err)
+	}
+
+	// Initialize subsystems
+	pm := process.NewManager(store, cfg.Logging.Dir)
+	portMgr := port.NewManager(store, cfg.Ports)
+	hc := health.NewChecker()
+
+	// Wire up health check → process manager integration
+	hc.OnUnhealthy(func(name string, status *health.Status) {
+		logger.Warn("process unhealthy",
+			"name", name,
+			"message", status.Message,
+			"consecutive_failures", status.Consecutive,
+		)
+	})
+
+	pm.OnStatusChange(func(name, status string) {
+		logger.Info("process status changed", "name", name, "status", status)
+	})
+
+	d := &Daemon{
+		config:         cfg,
+		store:          store,
+		processManager: pm,
+		portManager:    portMgr,
+		healthChecker:  hc,
+		logger:         logger,
+		stopCh:         make(chan struct{}),
+	}
+
+	return d, nil
+}
+
+// Run starts the daemon and blocks until shutdown.
+func (d *Daemon) Run() error {
+	d.logger.Info("DPM daemon starting", "version", Version)
+
+	// Write PID file
+	if err := d.writePIDFile(); err != nil {
+		return fmt.Errorf("write pid file: %w", err)
+	}
+	defer os.Remove(d.config.Daemon.PIDFile)
+
+	// Adopt orphan processes from previous daemon instance
+	if err := d.adoptOrphans(); err != nil {
+		d.logger.Warn("orphan adoption had errors", "error", err)
+	}
+
+	// Start API server on Unix socket
+	if err := d.startAPI(); err != nil {
+		return fmt.Errorf("start api: %w", err)
+	}
+
+	d.logger.Info("DPM daemon ready",
+		"socket", d.config.Daemon.Socket,
+		"version", Version,
+	)
+
+	// Wait for shutdown signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+
+	for {
+		select {
+		case sig := <-sigCh:
+			switch sig {
+			case syscall.SIGHUP:
+				d.logger.Info("received SIGHUP, reloading config")
+				// TODO: Reload config
+				continue
+			case syscall.SIGTERM, syscall.SIGINT:
+				d.logger.Info("received shutdown signal", "signal", sig.String())
+				return d.shutdown()
+			}
+		case <-d.stopCh:
+			return d.shutdown()
+		}
+	}
+}
+
+// adoptOrphans re-attaches processes that survived a daemon restart.
+func (d *Daemon) adoptOrphans() error {
+	processes, err := d.store.ListProcesses()
+	if err != nil {
+		return fmt.Errorf("list processes: %w", err)
+	}
+
+	if len(processes) == 0 {
+		d.logger.Info("no orphan processes to adopt")
+		return nil
+	}
+
+	adopted := 0
+	restarted := 0
+
+	for _, ps := range processes {
+		if ps.PID <= 0 {
+			continue
+		}
+
+		if processAlive(ps.PID) {
+			if err := d.processManager.Attach(ps); err != nil {
+				d.logger.Warn("failed to adopt process",
+					"name", ps.Name,
+					"pid", ps.PID,
+					"error", err,
+				)
+				continue
+			}
+			adopted++
+			d.logger.Info("re-adopted process",
+				"name", ps.Name,
+				"pid", ps.PID,
+			)
+		} else if ps.RestartPolicy == "always" {
+			// Process died during upgrade, restart it
+			var cfg config.ProcessConfig
+			if err := json.Unmarshal(ps.ConfigJSON, &cfg); err != nil {
+				d.logger.Warn("failed to unmarshal config for restart",
+					"name", ps.Name,
+					"error", err,
+				)
+				continue
+			}
+
+			ports := []int{ps.Port}
+			if ps.SecondaryPort > 0 {
+				ports = append(ports, ps.SecondaryPort)
+			}
+
+			if err := d.processManager.Start(&cfg, ports); err != nil {
+				d.logger.Warn("failed to restart dead process",
+					"name", ps.Name,
+					"error", err,
+				)
+				continue
+			}
+			restarted++
+			d.logger.Info("restarted dead process",
+				"name", ps.Name,
+			)
+		}
+	}
+
+	d.logger.Info("orphan adoption complete",
+		"adopted", adopted,
+		"restarted", restarted,
+		"total", len(processes),
+	)
+
+	return nil
+}
+
+// startAPI starts the HTTP API server on the Unix socket.
+func (d *Daemon) startAPI() error {
+	// Remove stale socket file
+	os.Remove(d.config.Daemon.Socket)
+
+	// Ensure socket directory exists
+	socketDir := d.config.Daemon.Socket[:len(d.config.Daemon.Socket)-len("/dpm.sock")]
+	if err := os.MkdirAll(socketDir, 0755); err != nil {
+		return fmt.Errorf("create socket dir: %w", err)
+	}
+
+	listener, err := net.Listen("unix", d.config.Daemon.Socket)
+	if err != nil {
+		return fmt.Errorf("listen unix socket: %w", err)
+	}
+
+	// Set socket permissions so depfloy user can access
+	os.Chmod(d.config.Daemon.Socket, 0660)
+
+	handler := api.NewRouter(
+		d.processManager,
+		d.portManager,
+		d.healthChecker,
+		d.store,
+		d.config,
+		d.logger,
+	)
+
+	d.listener = listener
+	d.apiServer = &http.Server{Handler: handler}
+
+	go func() {
+		if err := d.apiServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+			d.logger.Error("api server error", "error", err)
+		}
+	}()
+
+	return nil
+}
+
+// shutdown performs graceful daemon shutdown.
+func (d *Daemon) shutdown() error {
+	d.logger.Info("shutting down daemon")
+
+	// Note: We do NOT stop managed processes here.
+	// KillMode=process in systemd ensures child processes survive.
+	// We only save state so the next daemon instance can adopt them.
+
+	// Close API server
+	if d.apiServer != nil {
+		d.apiServer.Close()
+	}
+	if d.listener != nil {
+		d.listener.Close()
+	}
+
+	// Persist final state
+	d.logger.Info("saving final state")
+
+	// Close state store
+	if err := d.store.Close(); err != nil {
+		d.logger.Error("failed to close state store", "error", err)
+	}
+
+	d.logger.Info("daemon stopped")
+	return nil
+}
+
+// writePIDFile writes the current process PID to the configured file.
+func (d *Daemon) writePIDFile() error {
+	pidDir := d.config.Daemon.PIDFile[:len(d.config.Daemon.PIDFile)-len("/dpm.pid")]
+	if err := os.MkdirAll(pidDir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(d.config.Daemon.PIDFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
+}
+
+// processAlive checks if a process with the given PID exists.
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}
