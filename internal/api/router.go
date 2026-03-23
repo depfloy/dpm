@@ -389,15 +389,18 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if format == "json" {
-		// Parse lines into structured entries, merging continuation lines
+		// Parse lines into structured entries, merging stack trace continuations
 		engine := dpmlog.NewEngine(r.config.Logging.Dir)
 		var entries []dpmlog.Entry
 		for _, line := range allLines {
 			entry := engine.ParseLine(line, name)
-			// Continuation lines (tab-indented) merge into previous entry
-			if len(entries) > 0 && strings.Contains(line, "\t") &&
-				len(line) > 20 && line[:20] == entries[len(entries)-1].Timestamp.Format("2006-01-02T15:04:05Z") {
-				entries[len(entries)-1].Message += "\n" + strings.TrimSpace(entry.Message)
+			msg := strings.TrimSpace(entry.Message)
+
+			// Merge into previous entry if this is a continuation line
+			// (stack trace "at ...", braces, error properties)
+			if len(entries) > 0 && isContinuation(msg) {
+				prev := &entries[len(entries)-1]
+				prev.Message += "\n" + msg
 			} else {
 				entries = append(entries, entry)
 			}
@@ -432,6 +435,26 @@ func readLastLines(path string, n int) []string {
 		lines = lines[len(lines)-n:]
 	}
 	return lines
+}
+
+// isContinuation detects stack trace and multi-line error continuation lines.
+func isContinuation(msg string) bool {
+	if msg == "" {
+		return false
+	}
+	if strings.HasPrefix(msg, "at ") {
+		return true
+	}
+	trimmed := strings.TrimSpace(msg)
+	if trimmed == "}" || trimmed == "{" || trimmed == "})" || trimmed == "});" {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "code:") || strings.HasPrefix(trimmed, "errno:") ||
+		strings.HasPrefix(trimmed, "syscall:") || strings.HasPrefix(trimmed, "address:") ||
+		strings.HasPrefix(trimmed, "port:") {
+		return true
+	}
+	return false
 }
 
 // parseLineTimestamp extracts the timestamp from a DPM log line prefix.
