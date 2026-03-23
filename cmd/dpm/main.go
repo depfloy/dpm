@@ -154,13 +154,13 @@ func cmdList() {
 		return
 	}
 
-	// Fixed-width format to avoid ANSI color codes breaking tabwriter
-	hdr := "%-20s %-8s %-17s %-7s %-6s %-10s %-10s %s\n"
-	row := "%-20s %-8s %-17s %-7s %-6s %-10s %-10s %d\n"
+	// Build rows with manual padding, then colorize status in-place
+	type row struct {
+		name, typ, status, pid, port, mem, uptime string
+		restarts                                  int
+	}
 
-	fmt.Printf(hdr, "NAME", "TYPE", "STATUS", "PID", "PORT", "MEMORY", "UPTIME", "RESTARTS")
-	fmt.Printf(hdr, "----", "----", "------", "---", "----", "------", "------", "--------")
-
+	var rows []row
 	for _, p := range resp.Data {
 		pid := "-"
 		if p.PID > 0 {
@@ -170,11 +170,47 @@ func cmdList() {
 		if p.Port > 0 {
 			portStr = fmt.Sprintf("%d", p.Port)
 		}
-		mem := formatBytes(p.MemoryBytes)
-		uptime := formatDuration(time.Duration(p.UptimeNs))
-		status := colorStatus(p.Status)
+		rows = append(rows, row{
+			name:     p.Name,
+			typ:      p.Type,
+			status:   p.Status,
+			pid:      pid,
+			port:     portStr,
+			mem:      formatBytes(p.MemoryBytes),
+			uptime:   formatDuration(time.Duration(p.UptimeNs)),
+			restarts: p.RestartCount,
+		})
+	}
 
-		fmt.Printf(row, p.Name, p.Type, status, pid, portStr, mem, uptime, p.RestartCount)
+	// Calculate column widths from actual content (no ANSI)
+	cw := [8]int{4, 4, 6, 3, 4, 6, 6, 8} // min = header widths
+	for _, r := range rows {
+		if len(r.name) > cw[0] { cw[0] = len(r.name) }
+		if len(r.typ) > cw[1] { cw[1] = len(r.typ) }
+		if len(r.status) > cw[2] { cw[2] = len(r.status) }
+		if len(r.pid) > cw[3] { cw[3] = len(r.pid) }
+		if len(r.port) > cw[4] { cw[4] = len(r.port) }
+		if len(r.mem) > cw[5] { cw[5] = len(r.mem) }
+		if len(r.uptime) > cw[6] { cw[6] = len(r.uptime) }
+	}
+
+	// Print with calculated widths
+	fmtStr := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s\n",
+		cw[0], cw[1], cw[2], cw[3], cw[4], cw[5], cw[6])
+
+	fmt.Printf(fmtStr, "NAME", "TYPE", "STATUS", "PID", "PORT", "MEMORY", "UPTIME", "RESTARTS")
+
+	sep := func(n int) string { s := ""; for i := 0; i < n; i++ { s += "-" }; return s }
+	fmt.Printf(fmtStr, sep(cw[0]), sep(cw[1]), sep(cw[2]), sep(cw[3]), sep(cw[4]), sep(cw[5]), sep(cw[6]), sep(8))
+
+	for _, r := range rows {
+		// Pad status WITHOUT color, then wrap with color
+		padded := fmt.Sprintf("%-*s", cw[2], r.status)
+		colored := colorWrap(padded, r.status)
+
+		fmt.Printf(fmt.Sprintf("%%-%ds  %%-%ds  %%s  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%d\n",
+			cw[0], cw[1], cw[3], cw[4], cw[5], cw[6]),
+			r.name, r.typ, colored, r.pid, r.port, r.mem, r.uptime, r.restarts)
 	}
 }
 
@@ -547,20 +583,17 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-func colorStatus(status string) string {
-	// Pad status to 8 chars so ANSI codes don't break tabwriter alignment.
-	// ANSI codes add 9 invisible chars, so we pad to 8+9=17 total width
-	// to make tabwriter see consistent column widths.
-	padded := fmt.Sprintf("%-8s", status)
+// colorWrap wraps already-padded text with ANSI color based on status value.
+func colorWrap(padded, status string) string {
 	switch status {
 	case "online":
-		return "\033[32m" + padded + "\033[0m" // green
+		return "\033[32m" + padded + "\033[0m"
 	case "stopped":
-		return "\033[90m" + padded + "\033[0m" // gray
+		return "\033[90m" + padded + "\033[0m"
 	case "errored":
-		return "\033[31m" + padded + "\033[0m" // red
+		return "\033[31m" + padded + "\033[0m"
 	case "starting":
-		return "\033[33m" + padded + "\033[0m" // yellow
+		return "\033[33m" + padded + "\033[0m"
 	default:
 		return padded
 	}
