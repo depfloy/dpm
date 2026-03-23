@@ -389,12 +389,18 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if format == "json" {
-		// Parse each line into structured log entry
+		// Parse lines into structured entries, merging continuation lines
 		engine := dpmlog.NewEngine(r.config.Logging.Dir)
 		var entries []dpmlog.Entry
 		for _, line := range allLines {
 			entry := engine.ParseLine(line, name)
-			entries = append(entries, entry)
+			// Continuation lines (tab-indented) merge into previous entry
+			if len(entries) > 0 && strings.Contains(line, "\t") &&
+				len(line) > 20 && line[:20] == entries[len(entries)-1].Timestamp.Format("2006-01-02T15:04:05Z") {
+				entries[len(entries)-1].Message += "\n" + strings.TrimSpace(entry.Message)
+			} else {
+				entries = append(entries, entry)
+			}
 		}
 		r.successResponse(w, entries)
 	} else {

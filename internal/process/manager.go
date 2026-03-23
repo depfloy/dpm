@@ -641,9 +641,13 @@ func resolveTimeout(s string, fallback time.Duration) time.Duration {
 }
 
 // timestampWriter wraps an io.Writer and prepends ISO8601 timestamp to each line.
+// Continuation lines (stack traces starting with "at ", whitespace, or common
+// error continuation patterns) are written without a new timestamp so the log
+// parser can group them with the preceding entry.
 type timestampWriter struct {
-	w   *os.File
-	buf []byte
+	w      *os.File
+	buf    []byte
+	lastTS string
 }
 
 func (tw *timestampWriter) Write(p []byte) (int, error) {
@@ -668,12 +672,44 @@ func (tw *timestampWriter) Write(p []byte) (int, error) {
 			continue
 		}
 
-		ts := time.Now().UTC().Format(time.RFC3339)
-		_, err := fmt.Fprintf(tw.w, "%s %s\n", ts, line)
-		if err != nil {
-			return len(p), err
+		if isContinuationLine(line) {
+			// Continuation: use same timestamp, indent with tab
+			_, err := fmt.Fprintf(tw.w, "%s \t%s\n", tw.lastTS, line)
+			if err != nil {
+				return len(p), err
+			}
+		} else {
+			tw.lastTS = time.Now().UTC().Format(time.RFC3339)
+			_, err := fmt.Fprintf(tw.w, "%s %s\n", tw.lastTS, line)
+			if err != nil {
+				return len(p), err
+			}
 		}
 	}
 
 	return len(p), nil
+}
+
+// isContinuationLine detects stack trace and multi-line error continuation lines.
+func isContinuationLine(line string) bool {
+	if len(line) == 0 {
+		return false
+	}
+	// Lines starting with whitespace, "at ", "}", "  code:", "  errno:", "  syscall:"
+	if line[0] == ' ' || line[0] == '\t' {
+		return true
+	}
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "at ") {
+		return true
+	}
+	if trimmed == "}" || trimmed == "{" || trimmed == "})" {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "code:") || strings.HasPrefix(trimmed, "errno:") ||
+		strings.HasPrefix(trimmed, "syscall:") || strings.HasPrefix(trimmed, "address:") ||
+		strings.HasPrefix(trimmed, "port:") {
+		return true
+	}
+	return false
 }
