@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -234,6 +235,7 @@ func cmdLogs(args []string) {
 	lines := "100"
 	level := ""
 	isJSON := false
+	isFollow := false
 
 	for _, a := range args {
 		switch {
@@ -243,13 +245,15 @@ func cmdLogs(args []string) {
 			level = strings.TrimPrefix(a, "--level=")
 		case a == "--json":
 			isJSON = true
+		case a == "-f" || a == "--follow":
+			isFollow = true
 		case !strings.HasPrefix(a, "-"):
 			name = a
 		}
 	}
 
 	if name == "" {
-		fatal("Usage: dpm logs <name> [--lines=100] [--level=error] [--json]")
+		fatal("Usage: dpm logs <name> [--lines=100] [--level=error] [--json] [-f]")
 	}
 
 	query := fmt.Sprintf("?lines=%s", lines)
@@ -258,6 +262,22 @@ func cmdLogs(args []string) {
 	}
 	if isJSON {
 		query += "&format=json"
+	}
+	if isFollow {
+		query += "&follow=true"
+		// Stream mode: read response line by line
+		client := httpClient()
+		resp, err := client.Get("http://dpm" + fmt.Sprintf("/api/v1/logs/%s%s", name, query))
+		if err != nil {
+			fatal("Failed to connect to DPM daemon: %v\nIs dpmd running?", err)
+		}
+		defer resp.Body.Close()
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			fmt.Println(scanner.Text())
+		}
+		return
 	}
 
 	body := apiGet(fmt.Sprintf("/api/v1/logs/%s%s", name, query))

@@ -3,6 +3,7 @@ package process
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	dpmlog "github.com/depfloy/dpm/internal/log"
 	"github.com/depfloy/dpm/internal/state"
 	"github.com/depfloy/dpm/pkg/config"
 )
@@ -56,19 +58,25 @@ type managed struct {
 
 // Manager handles process lifecycle operations.
 type Manager struct {
-	mu        sync.RWMutex
-	processes map[string]*managed // key: "name" or "name:instance"
-	store     *state.Store
-	logDir    string
+	mu             sync.RWMutex
+	processes      map[string]*managed // key: "name" or "name:instance"
+	store          *state.Store
+	logDir         string
+	maxLogSize     int64
+	maxLogBackups  int
+	logCompress    bool
 	onStatusChange func(name, status string)
 }
 
 // NewManager creates a new process manager.
-func NewManager(store *state.Store, logDir string) *Manager {
+func NewManager(store *state.Store, logDir string, rotation config.RotationConfig) *Manager {
 	return &Manager{
-		processes: make(map[string]*managed),
-		store:     store,
-		logDir:    logDir,
+		processes:     make(map[string]*managed),
+		store:         store,
+		logDir:        logDir,
+		maxLogSize:    dpmlog.ParseMaxSize(rotation.MaxSize),
+		maxLogBackups: rotation.MaxBackups,
+		logCompress:   rotation.Compress,
 	}
 }
 
@@ -387,7 +395,7 @@ func (m *Manager) stopProcess(proc *managed) {
 }
 
 // monitor watches a started process for exit and handles restarts.
-func (m *Manager) monitor(proc *managed, key string, logFile, errFile *os.File) {
+func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer) {
 	defer logFile.Close()
 	defer errFile.Close()
 
@@ -511,8 +519,8 @@ func (m *Manager) notifyStatusChange(name, status string) {
 	}
 }
 
-// openLogFiles creates log files for a process instance.
-func (m *Manager) openLogFiles(name string, instance int) (*os.File, *os.File, error) {
+// openLogFiles creates rotating log writers for a process instance.
+func (m *Manager) openLogFiles(name string, instance int) (io.WriteCloser, io.WriteCloser, error) {
 	dir := fmt.Sprintf("%s/apps/%s", m.logDir, name)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, nil, err
@@ -526,18 +534,18 @@ func (m *Manager) openLogFiles(name string, instance int) (*os.File, *os.File, e
 		errPath = fmt.Sprintf("%s/instance-%d.error.log", dir, instance)
 	}
 
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	logWriter, err := dpmlog.NewRotatingWriter(logPath, m.maxLogSize, m.maxLogBackups, m.logCompress)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	errFile, err := os.OpenFile(errPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	errWriter, err := dpmlog.NewRotatingWriter(errPath, m.maxLogSize, m.maxLogBackups, m.logCompress)
 	if err != nil {
-		logFile.Close()
+		logWriter.Close()
 		return nil, nil, err
 	}
 
-	return logFile, errFile, nil
+	return logWriter, errWriter, nil
 }
 
 // instanceKey generates a key for a process instance.
@@ -645,7 +653,7 @@ func resolveTimeout(s string, fallback time.Duration) time.Duration {
 // error continuation patterns) are written without a new timestamp so the log
 // parser can group them with the preceding entry.
 type timestampWriter struct {
-	w      *os.File
+	w      io.Writer
 	buf    []byte
 	lastTS string
 }

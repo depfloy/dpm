@@ -347,6 +347,7 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	}
 
 	level := req.URL.Query().Get("level")
+	follow := req.URL.Query().Get("follow") == "true"
 	format := req.URL.Query().Get("format") // "json" or empty for plain text
 
 	// Read log files
@@ -410,6 +411,68 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		for _, line := range allLines {
 			fmt.Fprintln(w, line)
+		}
+
+		// Follow mode: stream new lines
+		if follow {
+			flusher, ok := w.(http.Flusher)
+			if ok {
+				flusher.Flush()
+			}
+
+			// Track file sizes
+			logDir := filepath.Join(r.config.Logging.Dir, "apps", name)
+			positions := make(map[string]int64)
+			allFiles := []string{"current.log", "instance-1.log", "instance-2.log", "instance-3.log",
+				"error.log", "instance-1.error.log", "instance-2.error.log", "instance-3.error.log"}
+			if level == "error" {
+				allFiles = []string{"error.log", "instance-1.error.log", "instance-2.error.log", "instance-3.error.log"}
+			}
+			for _, f := range allFiles {
+				p := filepath.Join(logDir, f)
+				if info, err := os.Stat(p); err == nil {
+					positions[p] = info.Size()
+				}
+			}
+
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-req.Context().Done():
+					return
+				case <-ticker.C:
+					for _, f := range allFiles {
+						p := filepath.Join(logDir, f)
+						info, err := os.Stat(p)
+						if err != nil {
+							continue
+						}
+						pos := positions[p]
+						if info.Size() <= pos {
+							continue
+						}
+						file, err := os.Open(p)
+						if err != nil {
+							continue
+						}
+						file.Seek(pos, 0)
+						scanner := bufio.NewScanner(file)
+						for scanner.Scan() {
+							line := scanner.Text()
+							if line != "" {
+								fmt.Fprintln(w, line)
+							}
+						}
+						positions[p] = info.Size()
+						file.Close()
+						if ok {
+							flusher.Flush()
+						}
+					}
+				}
+			}
 		}
 	}
 }

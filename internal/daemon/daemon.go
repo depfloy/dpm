@@ -56,7 +56,7 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 	}
 
 	// Initialize subsystems
-	pm := process.NewManager(store, cfg.Logging.Dir)
+	pm := process.NewManager(store, cfg.Logging.Dir, cfg.Logging.Rotation)
 	portMgr := port.NewManager(store, cfg.Ports)
 	hc := health.NewChecker()
 	nginxMgr := nginx.NewManager(cfg.Nginx.ConfigDir, cfg.Nginx.ReloadCommand, pm)
