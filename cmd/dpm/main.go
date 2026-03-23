@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
 )
 
@@ -154,9 +153,12 @@ func cmdList() {
 		return
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tTYPE\tSTATUS\tPID\tPORT\tMEMORY\tUPTIME\tRESTARTS")
-	fmt.Fprintln(w, "----\t----\t------\t---\t----\t------\t------\t--------")
+	// Fixed-width format to avoid ANSI color codes breaking tabwriter
+	hdr := "%-20s %-8s %-17s %-7s %-6s %-10s %-10s %s\n"
+	row := "%-20s %-8s %-17s %-7s %-6s %-10s %-10s %d\n"
+
+	fmt.Printf(hdr, "NAME", "TYPE", "STATUS", "PID", "PORT", "MEMORY", "UPTIME", "RESTARTS")
+	fmt.Printf(hdr, "----", "----", "------", "---", "----", "------", "------", "--------")
 
 	for _, p := range resp.Data {
 		pid := "-"
@@ -171,10 +173,8 @@ func cmdList() {
 		uptime := formatDuration(time.Duration(p.UptimeNs))
 		status := colorStatus(p.Status)
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
-			p.Name, p.Type, status, pid, portStr, mem, uptime, p.RestartCount)
+		fmt.Printf(row, p.Name, p.Type, status, pid, portStr, mem, uptime, p.RestartCount)
 	}
-	w.Flush()
 }
 
 func cmdInfo(args []string) {
@@ -528,17 +528,21 @@ func formatDuration(d time.Duration) string {
 }
 
 func colorStatus(status string) string {
+	// Pad status to 8 chars so ANSI codes don't break tabwriter alignment.
+	// ANSI codes add 9 invisible chars, so we pad to 8+9=17 total width
+	// to make tabwriter see consistent column widths.
+	padded := fmt.Sprintf("%-8s", status)
 	switch status {
 	case "online":
-		return "\033[32m" + status + "\033[0m" // green
+		return "\033[32m" + padded + "\033[0m" // green
 	case "stopped":
-		return "\033[90m" + status + "\033[0m" // gray
+		return "\033[90m" + padded + "\033[0m" // gray
 	case "errored":
-		return "\033[31m" + status + "\033[0m" // red
+		return "\033[31m" + padded + "\033[0m" // red
 	case "starting":
-		return "\033[33m" + status + "\033[0m" // yellow
+		return "\033[33m" + padded + "\033[0m" // yellow
 	default:
-		return status
+		return padded
 	}
 }
 
