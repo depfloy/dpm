@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/depfloy/dpm/internal/health"
 	dpmlog "github.com/depfloy/dpm/internal/log"
@@ -373,9 +375,17 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// Sort all lines by timestamp descending (newest first).
+	// DPM prefixes each line with an RFC3339 timestamp like "2026-03-23T10:05:42Z ...".
+	sort.SliceStable(allLines, func(i, j int) bool {
+		ti := parseLineTimestamp(allLines[i])
+		tj := parseLineTimestamp(allLines[j])
+		return ti.After(tj)
+	})
+
 	// Limit total
 	if len(allLines) > lines {
-		allLines = allLines[len(allLines)-lines:]
+		allLines = allLines[:lines]
 	}
 
 	if format == "json" {
@@ -416,6 +426,29 @@ func readLastLines(path string, n int) []string {
 		lines = lines[len(lines)-n:]
 	}
 	return lines
+}
+
+// parseLineTimestamp extracts the timestamp from a DPM log line prefix.
+// Expected format: "2026-03-23T10:05:42Z message..." or RFC3339 with offset.
+// Returns time.Time zero value if parsing fails, which sorts these lines last.
+func parseLineTimestamp(line string) time.Time {
+	if len(line) < 20 {
+		return time.Time{}
+	}
+
+	// Try "2006-01-02T15:04:05Z" (20 chars)
+	if t, err := time.Parse("2006-01-02T15:04:05Z", line[:20]); err == nil {
+		return t
+	}
+
+	// Try RFC3339 with timezone offset (25 chars)
+	if len(line) >= 25 {
+		if t, err := time.Parse(time.RFC3339, line[:25]); err == nil {
+			return t
+		}
+	}
+
+	return time.Time{}
 }
 
 // --- Nginx Handlers ---
