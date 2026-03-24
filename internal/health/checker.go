@@ -28,6 +28,7 @@ type Checker struct {
 	stopChs  map[string]chan struct{}
 	client   *http.Client
 	onUnhealthy func(name string, status *Status)
+	onHealthy   func(name string, status *Status)
 }
 
 // NewChecker creates a new health checker.
@@ -47,6 +48,11 @@ func NewChecker() *Checker {
 // OnUnhealthy registers a callback for when a process becomes unhealthy.
 func (c *Checker) OnUnhealthy(fn func(name string, status *Status)) {
 	c.onUnhealthy = fn
+}
+
+// OnHealthy registers a callback for when a process recovers to healthy.
+func (c *Checker) OnHealthy(fn func(name string, status *Status)) {
+	c.onHealthy = fn
 }
 
 // StartMonitoring begins periodic health checks for a process.
@@ -105,8 +111,11 @@ func (c *Checker) StartMonitoring(name string, port int, cfg *config.HealthCheck
 					result.Consecutive = consecutivePass
 					if consecutivePass >= healthyThreshold {
 						result.Healthy = true
+						if !wasHealthy && c.onHealthy != nil {
+							go c.onHealthy(name, result)
+						}
 					} else {
-						result.Healthy = wasHealthy // Keep previous state
+						result.Healthy = wasHealthy
 					}
 				} else {
 					consecutiveFail++

@@ -142,6 +142,87 @@ func (m *Manager) Apply(req *ApplyRequest) *ApplyResult {
 	return result
 }
 
+// MarkWorkerDown removes an unhealthy worker's port from the upstream block and reloads nginx.
+// It reads the current config, removes the server line for the given port, and writes back.
+func (m *Manager) MarkWorkerDown(domain string, port int) error {
+	configPath := filepath.Join(m.configDir, "sites-available", domain)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	config := string(data)
+	// Remove the server line for this port
+	portStr := fmt.Sprintf("127.0.0.1:%d", port)
+	lines := strings.Split(config, "\n")
+	var newLines []string
+	for _, line := range lines {
+		if strings.Contains(line, portStr) && strings.Contains(line, "server ") {
+			continue // skip this worker
+		}
+		newLines = append(newLines, line)
+	}
+
+	newConfig := strings.Join(newLines, "\n")
+
+	// Backup and write
+	backupPath := configPath + ".bak"
+	copyFile(configPath, backupPath)
+
+	if err := os.WriteFile(configPath, []byte(newConfig), 0644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	// Validate
+	if _, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+		// Rollback
+		os.Rename(backupPath, configPath)
+		return fmt.Errorf("nginx test failed after removing worker")
+	}
+
+	// Reload
+	exec.Command("sh", "-c", m.reloadCommand).Run()
+	os.Remove(backupPath)
+	return nil
+}
+
+// MarkWorkerUp re-adds a recovered worker to the upstream block and reloads nginx.
+func (m *Manager) MarkWorkerUp(domain string, port int) error {
+	configPath := filepath.Join(m.configDir, "sites-available", domain)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	config := string(data)
+	portStr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	// Already in config?
+	if strings.Contains(config, portStr) {
+		return nil
+	}
+
+	// Find upstream block and add server line before keepalive
+	serverLine := fmt.Sprintf("    server %s max_fails=2 fail_timeout=5s;", portStr)
+	config = strings.Replace(config, "    keepalive", serverLine+"\n    keepalive", 1)
+
+	backupPath := configPath + ".bak"
+	copyFile(configPath, backupPath)
+
+	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	if _, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+		os.Rename(backupPath, configPath)
+		return fmt.Errorf("nginx test failed after adding worker")
+	}
+
+	exec.Command("sh", "-c", m.reloadCommand).Run()
+	os.Remove(backupPath)
+	return nil
+}
+
 // Remove deletes nginx config for a domain and reloads.
 func (m *Manager) Remove(domain string) *ApplyResult {
 	result := &ApplyResult{}
