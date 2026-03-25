@@ -92,7 +92,26 @@ func NewRouter(
 	mux.HandleFunc("/api/v1/health", r.handleHealth)
 	mux.HandleFunc("/api/v1/version", r.handleVersion)
 
-	return mux
+	// Wrap all handlers with panic recovery
+	return panicRecovery(mux, logger)
+}
+
+// panicRecovery wraps an http.Handler to recover from panics instead of crashing the daemon.
+func panicRecovery(next http.Handler, logger *slog.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				logger.Error("API handler panic recovered", "error", fmt.Sprintf("%v", err), "path", r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "error",
+					"error":  fmt.Sprintf("internal error: %v", err),
+				})
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // --- Process Handlers ---

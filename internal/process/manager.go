@@ -405,6 +405,14 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 	defer logFile.Close()
 	defer errFile.Close()
 
+	// Panic recovery - never crash the daemon
+	defer func() {
+		if r := recover(); r != nil {
+			proc.status = StatusErrored
+			m.persistProcess(proc, key)
+		}
+	}()
+
 	// Mark as online after brief startup period
 	time.Sleep(2 * time.Second)
 	if processAlive(proc.pid) {
@@ -441,8 +449,12 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 		shouldRestart = false
 	}
 
-	// Check max restarts
-	if proc.config.MaxRestarts > 0 && proc.restarts >= proc.config.MaxRestarts {
+	// Check max restarts - default limit 50 if not configured
+	maxRestarts := proc.config.MaxRestarts
+	if maxRestarts <= 0 {
+		maxRestarts = 50 // Safety net: never restart infinitely
+	}
+	if proc.restarts >= maxRestarts {
 		shouldRestart = false
 	}
 
@@ -467,6 +479,13 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 
 // monitorAdopted watches an adopted process (no cmd reference).
 func (m *Manager) monitorAdopted(proc *managed, key string) {
+	defer func() {
+		if r := recover(); r != nil {
+			proc.status = StatusErrored
+			m.persistProcess(proc, key)
+		}
+	}()
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 

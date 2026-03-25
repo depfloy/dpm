@@ -191,9 +191,25 @@ func (d *Daemon) adoptOrphans() error {
 
 	adopted := 0
 	restarted := 0
+	cleaned := 0
 
 	for _, ps := range processes {
+		// Clean up processes that exceeded max restarts or are in error state
+		if ps.RestartCount >= 50 || ps.Status == "errored" {
+			d.store.DeleteProcess(ps.Name)
+			cleaned++
+			d.logger.Info("cleaned stale process from state",
+				"name", ps.Name,
+				"restarts", ps.RestartCount,
+				"status", ps.Status,
+			)
+			continue
+		}
+
 		if ps.PID <= 0 {
+			// No PID - remove from state
+			d.store.DeleteProcess(ps.Name)
+			cleaned++
 			continue
 		}
 
@@ -204,6 +220,8 @@ func (d *Daemon) adoptOrphans() error {
 					"pid", ps.PID,
 					"error", err,
 				)
+				d.store.DeleteProcess(ps.Name)
+				cleaned++
 				continue
 			}
 			adopted++
@@ -244,6 +262,7 @@ func (d *Daemon) adoptOrphans() error {
 	d.logger.Info("orphan adoption complete",
 		"adopted", adopted,
 		"restarted", restarted,
+		"cleaned", cleaned,
 		"total", len(processes),
 	)
 
