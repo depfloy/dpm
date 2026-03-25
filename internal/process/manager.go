@@ -366,7 +366,13 @@ func (m *Manager) stopProcess(proc *managed) {
 		return
 	}
 
-	close(proc.stopCh)
+	// Safe close - channel may already be closed from a previous stop
+	select {
+	case <-proc.stopCh:
+		// Already closed
+	default:
+		close(proc.stopCh)
+	}
 	proc.status = StatusStopping
 
 	// Send configured signal to process group
