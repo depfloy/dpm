@@ -477,7 +477,7 @@ func httpClient() *http.Client {
 				return net.Dial("unix", socket)
 			},
 		},
-		Timeout: 30 * time.Second,
+		Timeout: 120 * time.Second,
 	}
 }
 
