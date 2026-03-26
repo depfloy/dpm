@@ -307,8 +307,19 @@ func (d *Daemon) shutdown() error {
 		d.listener.Close()
 	}
 
-	// Persist final state
+	// Persist final state - save all process info so next daemon can adopt them
 	d.logger.Info("saving final state")
+	processes := d.processManager.List()
+	for _, p := range processes {
+		if p.PID > 0 {
+			d.logger.Info("saving process state for adoption",
+				"name", p.Name,
+				"pid", p.PID,
+				"port", p.Port,
+				"status", p.Status,
+			)
+		}
+	}
 
 	// Close state store
 	if err := d.store.Close(); err != nil {

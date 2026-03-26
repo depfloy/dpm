@@ -204,8 +204,13 @@ fi
 
 # Start or restart daemon
 if systemctl is-active --quiet dpm; then
-    echo "==> Restarting DPM daemon..."
-    systemctl restart dpm
+    echo "==> Upgrading DPM daemon (zero-downtime)..."
+    # Stop daemon gracefully - KillMode=process keeps child processes alive
+    systemctl stop dpm
+    # Wait for BoltDB to close cleanly
+    sleep 2
+    # Start new daemon - it will adopt orphan processes from BoltDB state
+    systemctl start dpm
 else
     echo "==> Starting DPM daemon..."
     systemctl start dpm
