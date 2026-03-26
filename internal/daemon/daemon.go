@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -229,32 +228,14 @@ func (d *Daemon) adoptOrphans() error {
 				"name", ps.Name,
 				"pid", ps.PID,
 			)
-		} else if ps.RestartPolicy == "always" {
-			// Process died during upgrade, restart it
-			var cfg config.ProcessConfig
-			if err := json.Unmarshal(ps.ConfigJSON, &cfg); err != nil {
-				d.logger.Warn("failed to unmarshal config for restart",
-					"name", ps.Name,
-					"error", err,
-				)
-				continue
-			}
-
-			ports := []int{ps.Port}
-			if ps.SecondaryPort > 0 {
-				ports = append(ports, ps.SecondaryPort)
-			}
-
-			if err := d.processManager.Start(&cfg, ports); err != nil {
-				d.logger.Warn("failed to restart dead process",
-					"name", ps.Name,
-					"error", err,
-				)
-				continue
-			}
-			restarted++
-			d.logger.Info("restarted dead process",
+		} else {
+			// Process is dead - remove from state, don't auto-restart
+			// Restart will happen on next deploy or manual dpm start
+			d.store.DeleteProcess(ps.Name)
+			cleaned++
+			d.logger.Info("removed dead process from state",
 				"name", ps.Name,
+				"pid", ps.PID,
 			)
 		}
 	}
