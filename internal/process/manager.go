@@ -490,29 +490,14 @@ func (m *Manager) monitorAdopted(proc *managed, key string) {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// processAlive check does NOT need mutex - it's a read-only syscall
 		if !processAlive(proc.pid) {
+			// Process died - just mark as stopped, don't restart
+			// Restart will happen on next deploy
+			proc.status = StatusStopped
 			m.mu.Lock()
-
-			shouldRestart := proc.config.RestartPolicy == "always"
-			maxRestarts := proc.config.MaxRestarts
-			if maxRestarts <= 0 {
-				maxRestarts = 50
-			}
-			if proc.restarts >= maxRestarts {
-				shouldRestart = false
-			}
-
-			if shouldRestart {
-				proc.restarts++
-				delay := restartBackoff(proc.restarts)
-				m.mu.Unlock()
-				time.Sleep(delay)
-				m.startInstance(proc.config, key, proc.instance, proc.port)
-			} else {
-				proc.status = StatusErrored
-				m.persistProcess(proc, key)
-				m.mu.Unlock()
-			}
+			m.persistProcess(proc, key)
+			m.mu.Unlock()
 			return
 		}
 	}
