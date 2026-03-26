@@ -194,7 +194,7 @@ func (d *Daemon) adoptOrphans() error {
 
 	for _, ps := range processes {
 		// Clean up processes that exceeded max restarts or are in error state
-		if ps.RestartCount >= 50 || ps.Status == "errored" {
+		if ps.RestartCount >= 50 || ps.Status == "errored" || ps.Status == "stopped" {
 			d.store.DeleteProcess(ps.Name)
 			cleaned++
 			d.logger.Info("cleaned stale process from state",
