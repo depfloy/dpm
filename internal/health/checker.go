@@ -26,6 +26,7 @@ type Checker struct {
 	mu       sync.RWMutex
 	statuses map[string]*Status // key: process name
 	stopChs  map[string]chan struct{}
+	doneChs  map[string]chan struct{}
 	client   *http.Client
 	onUnhealthy func(name string, status *Status)
 	onHealthy   func(name string, status *Status)
@@ -36,6 +37,7 @@ func NewChecker() *Checker {
 	return &Checker{
 		statuses: make(map[string]*Status),
 		stopChs:  make(map[string]chan struct{}),
+		doneChs:  make(map[string]chan struct{}),
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -61,7 +63,17 @@ func (c *Checker) StartMonitoring(name string, port int, cfg *config.HealthCheck
 		return
 	}
 
+	// Stop old monitor and wait for it to exit
 	c.StopMonitoring(name)
+	c.mu.RLock()
+	doneCh := c.doneChs[name]
+	c.mu.RUnlock()
+	if doneCh != nil {
+		select {
+		case <-doneCh:
+		case <-time.After(10 * time.Second):
+		}
+	}
 
 	interval, _ := time.ParseDuration(cfg.Interval)
 	if interval == 0 {
@@ -69,12 +81,15 @@ func (c *Checker) StartMonitoring(name string, port int, cfg *config.HealthCheck
 	}
 
 	stopCh := make(chan struct{})
+	newDoneCh := make(chan struct{})
 	c.mu.Lock()
 	c.stopChs[name] = stopCh
+	c.doneChs[name] = newDoneCh
 	c.statuses[name] = &Status{Healthy: true, CheckType: cfg.Type}
 	c.mu.Unlock()
 
 	go func() {
+		defer close(newDoneCh)
 		// Initial delay to let process start
 		time.Sleep(5 * time.Second)
 

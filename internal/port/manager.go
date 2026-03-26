@@ -1,6 +1,7 @@
 package port
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -166,9 +167,12 @@ func (m *Manager) rangeForType(processType string) (int, int) {
 	}
 }
 
-// isPortFree checks if a port is available by attempting to listen on it.
+// isPortFree checks if a port is available by attempting to listen on it with a timeout.
 func isPortFree(port int) bool {
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	lc := net.ListenConfig{}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	ln, err := lc.Listen(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return false
 	}

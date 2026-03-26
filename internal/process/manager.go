@@ -494,16 +494,22 @@ func (m *Manager) monitorAdopted(proc *managed, key string) {
 			m.mu.Lock()
 
 			shouldRestart := proc.config.RestartPolicy == "always"
-			if proc.config.MaxRestarts > 0 && proc.restarts >= proc.config.MaxRestarts {
+			maxRestarts := proc.config.MaxRestarts
+			if maxRestarts <= 0 {
+				maxRestarts = 50
+			}
+			if proc.restarts >= maxRestarts {
 				shouldRestart = false
 			}
 
 			if shouldRestart {
 				proc.restarts++
+				delay := restartBackoff(proc.restarts)
 				m.mu.Unlock()
+				time.Sleep(delay)
 				m.startInstance(proc.config, key, proc.instance, proc.port)
 			} else {
-				proc.status = StatusStopped
+				proc.status = StatusErrored
 				m.persistProcess(proc, key)
 				m.mu.Unlock()
 			}
