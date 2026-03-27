@@ -362,7 +362,7 @@ func (m *Manager) ReloadAll() (int, int, error) {
 		cfg   *config.ProcessConfig
 		ports []int
 	}
-	saved := make(map[string]*savedProcess) // key: process name
+	saved := make(map[string]*savedProcess)
 
 	m.mu.RLock()
 	for _, proc := range m.processes {
@@ -377,7 +377,6 @@ func (m *Manager) ReloadAll() (int, int, error) {
 	// Also check BoltDB for any processes not in memory
 	states, _ := m.store.ListProcesses()
 	for _, ps := range states {
-		// Extract base process name from instance key (e.g., "app_238:0" → "app_238")
 		baseName := ps.Name
 		if idx := strings.Index(ps.Name, ":"); idx > 0 {
 			baseName = ps.Name[:idx]
@@ -394,23 +393,42 @@ func (m *Manager) ReloadAll() (int, int, error) {
 		return 0, 0, fmt.Errorf("no processes to reload")
 	}
 
-	// 2. Stop all running processes
+	// 2. Collect process list and PIDs, then clear map WITHOUT blocking on stop
 	m.mu.Lock()
+	var pidsToKill []int
 	for key, proc := range m.processes {
-		m.stopProcess(proc)
+		// Close stopCh so monitor goroutines exit cleanly
+		select {
+		case <-proc.stopCh:
+		default:
+			close(proc.stopCh)
+		}
+		if proc.pid > 0 {
+			pidsToKill = append(pidsToKill, proc.pid)
+		}
 		delete(m.processes, key)
 	}
 	m.mu.Unlock()
 
-	// 3. Clear all process state from BoltDB
+	// 3. Kill processes WITHOUT holding the mutex (non-blocking)
+	for _, pid := range pidsToKill {
+		syscall.Kill(-pid, syscall.SIGTERM)
+	}
+	time.Sleep(2 * time.Second)
+	for _, pid := range pidsToKill {
+		if processAlive(pid) {
+			syscall.Kill(-pid, syscall.SIGKILL)
+		}
+	}
+
+	// 4. Clear all process state from BoltDB
 	for _, ps := range states {
 		m.store.DeleteProcess(ps.Name)
 	}
 
-	// Brief pause to let ports free
 	time.Sleep(1 * time.Second)
 
-	// 4. Restart each process from saved config
+	// 5. Restart each process from saved config
 	restarted := 0
 	failed := 0
 	for _, sp := range saved {
