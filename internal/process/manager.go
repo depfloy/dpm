@@ -115,8 +115,9 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 	previousRestarts := 0
 	if existing, ok := m.processes[key]; ok {
 		if existing.status == StatusStopped || existing.status == StatusErrored {
-			// Dead process - clean start, reset counter
+			// Dead process - clean start, reset counter, remove stale entry
 			previousRestarts = 0
+			m.store.DeleteProcess(key)
 		} else {
 			previousRestarts = existing.restarts
 		}
@@ -601,53 +602,82 @@ func (m *Manager) Attach(ps *state.ProcessState) error {
 }
 
 // stopProcess sends the configured stop signal and waits, then SIGKILL if needed.
+// After stopping, verifies the port is actually freed to prevent orphan issues.
 func (m *Manager) stopProcess(proc *managed) {
 	stopSig := resolveSignal(proc.config.StopSignal)
 	stopTimeout := resolveTimeout(proc.config.StopTimeout, 10*time.Second)
 
-	if proc.cmd == nil || proc.cmd.Process == nil {
-		// Adopted process without cmd reference
-		if proc.pid > 0 {
-			syscall.Kill(-proc.pid, stopSig)
-			time.Sleep(stopTimeout)
-			if processAlive(proc.pid) {
-				syscall.Kill(-proc.pid, syscall.SIGKILL)
-			}
-		}
-		return
-	}
-
 	// Safe close - channel may already be closed from a previous stop
 	select {
 	case <-proc.stopCh:
-		// Already closed
 	default:
 		close(proc.stopCh)
 	}
 	proc.status = StatusStopping
 
-	// Send configured signal to process group
-	pgid, err := syscall.Getpgid(proc.pid)
-	if err == nil {
-		syscall.Kill(-pgid, stopSig)
+	if proc.cmd == nil || proc.cmd.Process == nil {
+		// Adopted process without cmd reference
+		if proc.pid > 0 {
+			syscall.Kill(-proc.pid, stopSig)
+			time.Sleep(2 * time.Second)
+			if processAlive(proc.pid) {
+				syscall.Kill(-proc.pid, syscall.SIGKILL)
+			}
+		}
+	} else {
+		// Send configured signal to process group
+		pgid, err := syscall.Getpgid(proc.pid)
+		if err == nil {
+			syscall.Kill(-pgid, stopSig)
+		}
+
+		// Wait for graceful shutdown up to configured timeout
+		done := make(chan struct{})
+		go func() {
+			proc.cmd.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Process exited gracefully
+		case <-time.After(stopTimeout):
+			// Force kill process group
+			if pgid > 0 {
+				syscall.Kill(-pgid, syscall.SIGKILL)
+			}
+			proc.cmd.Wait()
+		}
 	}
 
-	// Wait for graceful shutdown up to configured timeout
-	done := make(chan struct{})
-	go func() {
-		proc.cmd.Wait()
-		close(done)
-	}()
+	// Last resort: if port is still held by an orphan, kill it
+	if proc.port > 0 {
+		time.Sleep(500 * time.Millisecond)
+		killPortHolder(proc.port)
+	}
+}
 
-	select {
-	case <-done:
-		// Process exited gracefully
-	case <-time.After(stopTimeout):
-		// Force kill
-		if pgid > 0 {
-			syscall.Kill(-pgid, syscall.SIGKILL)
+// killPortHolder finds and kills the process listening on a port.
+func killPortHolder(port int) {
+	data, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		return
+	}
+	hexPort := fmt.Sprintf("%04X", port)
+	for _, line := range strings.Split(string(data), "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 10 || fields[3] != "0A" {
+			continue
 		}
-		proc.cmd.Wait()
+		parts := strings.Split(fields[1], ":")
+		if len(parts) == 2 && parts[1] == hexPort {
+			inode := fields[9]
+			pid := findPIDByInode(inode)
+			if pid > 0 {
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
+			return
+		}
 	}
 }
 
