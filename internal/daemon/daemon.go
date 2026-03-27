@@ -196,6 +196,9 @@ func (d *Daemon) adoptOrphans() error {
 		// Clean up processes that exceeded max restarts or are in error state
 		if ps.RestartCount >= 50 || ps.Status == "errored" || ps.Status == "stopped" {
 			d.store.DeleteProcess(ps.Name)
+			if ps.Port > 0 {
+				d.portManager.ReleasePort(ps.Port)
+			}
 			cleaned++
 			d.logger.Info("cleaned stale process from state",
 				"name", ps.Name,
@@ -208,6 +211,9 @@ func (d *Daemon) adoptOrphans() error {
 		if ps.PID <= 0 {
 			// No PID - remove from state
 			d.store.DeleteProcess(ps.Name)
+			if ps.Port > 0 {
+				d.portManager.ReleasePort(ps.Port)
+			}
 			cleaned++
 			continue
 		}
@@ -220,6 +226,9 @@ func (d *Daemon) adoptOrphans() error {
 					"error", err,
 				)
 				d.store.DeleteProcess(ps.Name)
+				if ps.Port > 0 {
+					d.portManager.ReleasePort(ps.Port)
+				}
 				cleaned++
 				continue
 			}
@@ -232,6 +241,9 @@ func (d *Daemon) adoptOrphans() error {
 			// Process is dead - remove from state, don't auto-restart
 			// Restart will happen on next deploy or manual dpm start
 			d.store.DeleteProcess(ps.Name)
+			if ps.Port > 0 {
+				d.portManager.ReleasePort(ps.Port)
+			}
 			cleaned++
 			d.logger.Info("removed dead process from state",
 				"name", ps.Name,

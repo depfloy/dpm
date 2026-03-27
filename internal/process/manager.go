@@ -474,7 +474,13 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 	m.mu.Unlock()
 
 	time.Sleep(delay)
-	m.startInstance(proc.config, key, proc.instance, proc.port)
+	if err := m.startInstance(proc.config, key, proc.instance, proc.port); err != nil {
+		m.mu.Lock()
+		proc.status = StatusErrored
+		m.persistProcess(proc, key)
+		m.mu.Unlock()
+		m.notifyStatusChange(key, StatusErrored)
+	}
 }
 
 // monitorAdopted watches an adopted process (no cmd reference).

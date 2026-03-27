@@ -181,6 +181,13 @@ func (r *Router) createProcess(w http.ResponseWriter, req *http.Request) {
 
 	// Allocate ports - use ResolveWorkerCount for cluster-aware count
 	workerCount := cfg.ResolveWorkerCount()
+
+	// Release old port allocations before allocating new ones
+	// to prevent port leak across deploys
+	if err := r.ports.Release(cfg.Name); err != nil {
+		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
+	}
+
 	var ports []int
 	if cfg.Port == "auto" {
 		allocated, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount)
