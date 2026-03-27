@@ -199,3 +199,96 @@ func TestMultiInstancePortTracking(t *testing.T) {
 	// Clean up
 	mgr.Stop("multi-port-app")
 }
+
+// TestPortsArrayExplicit verifies that when explicit Ports array is provided,
+// all workers use exactly those ports.
+func TestPortsArrayExplicit(t *testing.T) {
+	stateDir := t.TempDir()
+	logDir := t.TempDir()
+
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	mgr := NewManager(store, logDir, config.RotationConfig{MaxSize: "10MB", MaxBackups: 2})
+
+	cfg := testConfig("ports-array-app", "sleep 300")
+	cfg.Instances = 3
+	cfg.Ports = []int{9800, 9801, 9802}
+
+	// Start with explicit ports - should use Ports field count, not Instances
+	if err := mgr.Start(cfg, cfg.Ports); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	infos := mgr.List()
+	portMap := make(map[int]bool)
+	for _, info := range infos {
+		portMap[info.Port] = true
+	}
+
+	for _, expected := range []int{9800, 9801, 9802} {
+		if !portMap[expected] {
+			t.Errorf("expected port %d not found in running processes", expected)
+		}
+	}
+
+	mgr.Stop("ports-array-app")
+}
+
+// TestStoppedProcessCleanupOnRestart verifies that stopped/errored entries
+// get a clean restart counter when a new deploy starts.
+func TestStoppedProcessCleanupOnRestart(t *testing.T) {
+	stateDir := t.TempDir()
+	logDir := t.TempDir()
+
+	store, err := state.Open(stateDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	mgr := NewManager(store, logDir, config.RotationConfig{MaxSize: "10MB", MaxBackups: 2})
+
+	// Start a process, then manually set it to stopped with high restart count
+	cfg := testConfig("cleanup-app", "sleep 300")
+	if err := mgr.Start(cfg, []int{9810}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	// Simulate stopped state with accumulated restarts
+	mgr.mu.Lock()
+	for _, proc := range mgr.processes {
+		if proc.config.Name == "cleanup-app" {
+			proc.status = StatusStopped
+			proc.restarts = 25
+		}
+	}
+	mgr.mu.Unlock()
+
+	// Now start again (simulating a new deploy) - should reset counter
+	if err := mgr.Start(cfg, []int{9810}); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	mgr.mu.RLock()
+	for _, proc := range mgr.processes {
+		if proc.config.Name == "cleanup-app" {
+			if proc.restarts != 0 {
+				t.Errorf("restart count = %d after clean restart, want 0", proc.restarts)
+			}
+			if proc.status != StatusOnline && proc.status != StatusStarting {
+				t.Errorf("status = %s, want online or starting", proc.status)
+			}
+		}
+	}
+	mgr.mu.RUnlock()
+
+	mgr.Stop("cleanup-app")
+}

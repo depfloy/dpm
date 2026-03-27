@@ -186,13 +186,28 @@ func (r *Router) createProcess(w http.ResponseWriter, req *http.Request) {
 	workerCount := cfg.ResolveWorkerCount()
 
 	// Release old port allocations before allocating new ones
-	// to prevent port leak across deploys
 	if err := r.ports.Release(cfg.Name); err != nil {
 		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
 	}
 
 	var ports []int
-	if cfg.Port == "auto" {
+	if len(cfg.Ports) > 0 {
+		// Explicit port list: use each port, fallback to auto if busy
+		for _, p := range cfg.Ports {
+			if r.ports.IsPortFree(p) {
+				ports = append(ports, p)
+			} else {
+				// Port busy - find a free alternative
+				alt, err := r.ports.Allocate(cfg.Name, cfg.Type, 1)
+				if err != nil {
+					r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("no free fallback port: %v", err))
+					return
+				}
+				ports = append(ports, alt[0])
+				r.logger.Warn("port busy, using fallback", "wanted", p, "got", alt[0], "process", cfg.Name)
+			}
+		}
+	} else if cfg.Port == "auto" {
 		allocated, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount)
 		if err != nil {
 			r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("port allocation failed: %v", err))
@@ -205,9 +220,7 @@ func (r *Router) createProcess(w http.ResponseWriter, req *http.Request) {
 			r.errorResponse(w, http.StatusBadRequest, "port must be 'auto' or a number")
 			return
 		}
-		// First port is the specified one
 		ports = []int{p}
-		// Allocate remaining ports for additional workers
 		if workerCount > 1 {
 			additional, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount-1)
 			if err != nil {

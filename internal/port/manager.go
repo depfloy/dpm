@@ -167,6 +167,11 @@ func (m *Manager) rangeForType(processType string) (int, int) {
 	}
 }
 
+// IsPortFree checks if a port is available (exported for use by API layer).
+func (m *Manager) IsPortFree(port int) bool {
+	return isPortFree(port)
+}
+
 // isPortFree checks if a port is available by attempting to listen on it with a timeout.
 func isPortFree(port int) bool {
 	lc := net.ListenConfig{}

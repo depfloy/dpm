@@ -77,6 +77,7 @@ type ProcessConfig struct {
 
 	Instances int    `yaml:"instances,omitempty" json:"instances,omitempty"`
 	Port      string `yaml:"port,omitempty" json:"port,omitempty"` // "auto" or specific port number
+	Ports     []int  `yaml:"ports,omitempty" json:"ports,omitempty"` // Explicit port list for all workers
 
 	// Cluster mode: "auto" uses CPU cores, "fixed" uses Instances count.
 	// When set, all workers are active (no backup). Empty = legacy 2-instance mode.

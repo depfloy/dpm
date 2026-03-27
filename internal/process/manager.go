@@ -114,7 +114,12 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 	// Stop existing instance if running, carry forward restart count
 	previousRestarts := 0
 	if existing, ok := m.processes[key]; ok {
-		previousRestarts = existing.restarts
+		if existing.status == StatusStopped || existing.status == StatusErrored {
+			// Dead process - clean start, reset counter
+			previousRestarts = 0
+		} else {
+			previousRestarts = existing.restarts
+		}
 		m.stopProcess(existing)
 	}
 
