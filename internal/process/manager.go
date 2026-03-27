@@ -91,6 +91,19 @@ func (m *Manager) OnStatusChange(fn func(name, status string)) {
 func (m *Manager) Start(cfg *config.ProcessConfig, ports []int) error {
 	workerCount := cfg.ResolveWorkerCount()
 
+	// Stop ALL existing instances for this process name before starting new ones.
+	// This handles the case where worker count changed (e.g., cluster→single).
+	// Old keys like "app_238:0", "app_238:1" won't match new key "app_238".
+	m.mu.Lock()
+	for key, proc := range m.processes {
+		if proc.config.Name == cfg.Name {
+			m.stopProcess(proc)
+			delete(m.processes, key)
+			m.store.DeleteProcess(key)
+		}
+	}
+	m.mu.Unlock()
+
 	for i := 0; i < workerCount; i++ {
 		key := instanceKey(cfg.Name, i, workerCount)
 		port := 0
