@@ -196,6 +196,160 @@ func (m *Manager) Stop(name string) error {
 	return nil
 }
 
+// DeployResult represents the outcome of a blue-green deploy.
+type DeployResult struct {
+	Status   string `json:"status"`
+	NewPorts []int  `json:"new_ports"`
+	OldPorts []int  `json:"old_ports"`
+	Workers  int    `json:"workers"`
+	Message  string `json:"message,omitempty"`
+}
+
+// Deploy performs a blue-green deployment: starts new workers on new ports,
+// waits for them to be online, then gracefully shuts down old workers.
+// Old workers continue serving traffic until new workers are confirmed healthy,
+// ensuring zero-downtime.
+func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResult, error) {
+	workerCount := cfg.ResolveWorkerCount()
+
+	// 1. Collect old worker info
+	m.mu.RLock()
+	var oldKeys []string
+	var oldPorts []int
+	for key, proc := range m.processes {
+		if proc.config.Name == cfg.Name {
+			oldKeys = append(oldKeys, key)
+			oldPorts = append(oldPorts, proc.port)
+		}
+	}
+	m.mu.RUnlock()
+
+	// 2. Start new workers with deploy prefix keys (old workers still running)
+	for i := 0; i < workerCount; i++ {
+		deployKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, i)
+		port := 0
+		if i < len(newPorts) {
+			port = newPorts[i]
+		}
+		if err := m.startInstance(cfg, deployKey, i, port); err != nil {
+			// Cleanup: stop any new workers already started
+			for j := 0; j < i; j++ {
+				cleanKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, j)
+				m.mu.Lock()
+				if p, ok := m.processes[cleanKey]; ok {
+					m.stopProcess(p)
+					delete(m.processes, cleanKey)
+					m.store.DeleteProcess(cleanKey)
+				}
+				m.mu.Unlock()
+			}
+			return nil, fmt.Errorf("start new worker %d: %w", i, err)
+		}
+	}
+
+	// 3. Wait for all new workers to be online (max 30s)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		allOnline := true
+		m.mu.RLock()
+		for i := 0; i < workerCount; i++ {
+			deployKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, i)
+			if proc, ok := m.processes[deployKey]; ok {
+				if proc.status != StatusOnline {
+					allOnline = false
+					break
+				}
+			} else {
+				allOnline = false
+				break
+			}
+		}
+		m.mu.RUnlock()
+
+		if allOnline {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Verify all new workers are online
+	m.mu.RLock()
+	allOnline := true
+	for i := 0; i < workerCount; i++ {
+		deployKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, i)
+		if proc, ok := m.processes[deployKey]; ok {
+			if proc.status != StatusOnline {
+				allOnline = false
+			}
+		} else {
+			allOnline = false
+		}
+	}
+	m.mu.RUnlock()
+
+	if !allOnline {
+		// Rollback: stop new workers, keep old ones running
+		for i := 0; i < workerCount; i++ {
+			deployKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, i)
+			m.mu.Lock()
+			if p, ok := m.processes[deployKey]; ok {
+				m.stopProcess(p)
+				delete(m.processes, deployKey)
+				m.store.DeleteProcess(deployKey)
+			}
+			m.mu.Unlock()
+		}
+		return nil, fmt.Errorf("new workers failed to come online within 30s")
+	}
+
+	// 4. Promote: swap deploy keys to final keys
+	drainTimeout := resolveTimeout(cfg.DrainTimeout(), 30*time.Second)
+
+	m.mu.Lock()
+	// Collect old workers for deferred cleanup
+	type oldWorker struct {
+		proc *managed
+		key  string
+	}
+	var oldWorkers []oldWorker
+	for _, oldKey := range oldKeys {
+		if proc, ok := m.processes[oldKey]; ok {
+			oldWorkers = append(oldWorkers, oldWorker{proc: proc, key: oldKey})
+			delete(m.processes, oldKey)
+		}
+	}
+
+	// Move new workers from deploy keys to final keys
+	for i := 0; i < workerCount; i++ {
+		deployKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, i)
+		finalKey := instanceKey(cfg.Name, i, workerCount)
+		if proc, ok := m.processes[deployKey]; ok {
+			delete(m.processes, deployKey)
+			m.store.DeleteProcess(deployKey)
+			m.processes[finalKey] = proc
+			m.persistProcess(proc, finalKey)
+		}
+	}
+	m.mu.Unlock()
+
+	// 5. Graceful shutdown of old workers in background after drain timeout
+	// This gives the caller time to update nginx with new ports
+	go func() {
+		time.Sleep(drainTimeout)
+		for _, ow := range oldWorkers {
+			m.stopProcess(ow.proc)
+			m.store.DeleteProcess(ow.key)
+		}
+	}()
+
+	return &DeployResult{
+		Status:   "success",
+		NewPorts: newPorts,
+		OldPorts: oldPorts,
+		Workers:  workerCount,
+	}, nil
+}
+
 // Restart stops and starts a process.
 func (m *Manager) Restart(name string) error {
 	m.mu.RLock()

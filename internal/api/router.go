@@ -157,6 +157,8 @@ func (r *Router) handleProcess(w http.ResponseWriter, req *http.Request) {
 		r.stopProcess(w, name)
 	case action == "restart" && req.Method == http.MethodPost:
 		r.restartProcess(w, name)
+	case action == "deploy" && req.Method == http.MethodPost:
+		r.deployProcess(w, req)
 	default:
 		r.methodNotAllowed(w)
 	}
@@ -293,6 +295,72 @@ func (r *Router) stopProcess(w http.ResponseWriter, name string) {
 
 	r.logger.Info("process stopped", "name", name)
 	r.successResponse(w, map[string]string{"stopped": name})
+}
+
+func (r *Router) deployProcess(w http.ResponseWriter, req *http.Request) {
+	var cfg config.ProcessConfig
+	if err := json.NewDecoder(req.Body).Decode(&cfg); err != nil {
+		r.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid config: %v", err))
+		return
+	}
+
+	if cfg.Name == "" || cfg.Command == "" {
+		r.errorResponse(w, http.StatusBadRequest, "name and command are required")
+		return
+	}
+
+	// Release old port allocations
+	if err := r.ports.Release(cfg.Name); err != nil {
+		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
+	}
+
+	// Allocate new ports
+	workerCount := cfg.ResolveWorkerCount()
+	var newPorts []int
+	if cfg.Port == "auto" {
+		allocated, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount)
+		if err != nil {
+			r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("port allocation failed: %v", err))
+			return
+		}
+		newPorts = allocated
+	} else if cfg.Port != "" {
+		p, err := strconv.Atoi(cfg.Port)
+		if err != nil {
+			r.errorResponse(w, http.StatusBadRequest, "port must be 'auto' or a number")
+			return
+		}
+		newPorts = []int{p}
+		if workerCount > 1 {
+			additional, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount-1)
+			if err != nil {
+				r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("additional port allocation failed: %v", err))
+				return
+			}
+			newPorts = append(newPorts, additional...)
+		}
+	}
+
+	// Blue-green deploy: start new workers, wait for online, then drain old
+	result, err := r.pm.Deploy(&cfg, newPorts)
+	if err != nil {
+		r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("deploy failed: %v", err))
+		return
+	}
+
+	// Start health monitoring if configured
+	if cfg.HealthCheck != nil && len(newPorts) > 0 {
+		r.health.StartMonitoring(cfg.Name, newPorts[0], cfg.HealthCheck)
+	}
+
+	r.logger.Info("blue-green deploy completed",
+		"name", cfg.Name,
+		"new_ports", newPorts,
+		"old_ports", result.OldPorts,
+		"workers", result.Workers,
+	)
+
+	r.successResponse(w, result)
 }
 
 func (r *Router) restartProcess(w http.ResponseWriter, name string) {

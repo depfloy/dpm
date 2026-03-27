@@ -32,6 +32,8 @@ func main() {
 	switch cmd {
 	case "start":
 		cmdStart(args)
+	case "deploy":
+		cmdDeploy(args)
 	case "stop":
 		cmdStop(args)
 	case "restart":
@@ -91,6 +93,37 @@ func cmdStart(args []string) {
 	}
 
 	resp := apiPost("/api/v1/processes", body)
+	printJSON(resp)
+}
+
+func cmdDeploy(args []string) {
+	if len(args) == 0 {
+		fatal("Usage: dpm deploy --config='<json>'")
+	}
+
+	arg := args[0]
+	var body []byte
+
+	if strings.HasPrefix(arg, "--config=") {
+		body = []byte(strings.TrimPrefix(arg, "--config="))
+	} else {
+		data, err := os.ReadFile(arg)
+		if err != nil {
+			fatal("Failed to read config: %v", err)
+		}
+		body = data
+	}
+
+	// Parse config to get process name for the deploy endpoint
+	var cfg struct {
+		Name string `json:"name"`
+	}
+	json.Unmarshal(body, &cfg)
+	if cfg.Name == "" {
+		fatal("Config must include 'name' field")
+	}
+
+	resp := apiPost(fmt.Sprintf("/api/v1/processes/%s/deploy", cfg.Name), body)
 	printJSON(resp)
 }
 
@@ -618,6 +651,7 @@ Usage: dpm <command> [options]
 
 Commands:
   start <config.yaml>       Start a new process
+  deploy --config='<json>'  Blue-green deploy (zero-downtime)
   stop <name>               Stop a process
   restart <name>            Restart a process
   delete <name>             Stop and remove a process
