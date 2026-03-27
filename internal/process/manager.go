@@ -978,6 +978,181 @@ func (tw *timestampWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// DoctorReport contains the results of a health check.
+type DoctorReport struct {
+	Zombies       []DoctorEntry `json:"zombies"`
+	Orphans       []DoctorEntry `json:"orphans"`
+	ZombiesFixed  int           `json:"zombies_fixed"`
+	OrphansFixed  int           `json:"orphans_fixed"`
+}
+
+// DoctorEntry represents a single issue found by Doctor.
+type DoctorEntry struct {
+	PID    int    `json:"pid"`
+	Port   int    `json:"port"`
+	Name   string `json:"name,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
+// Doctor performs a health check on managed processes.
+// If fix is true, it cleans up zombie entries and kills orphan processes.
+func (m *Manager) Doctor(fix bool) *DoctorReport {
+	report := &DoctorReport{}
+
+	// 1. Find zombie processes (stopped/errored in m.processes)
+	m.mu.Lock()
+	var zombieKeys []string
+	for key, proc := range m.processes {
+		if proc.status == StatusStopped || proc.status == StatusErrored {
+			report.Zombies = append(report.Zombies, DoctorEntry{
+				PID:    proc.pid,
+				Port:   proc.port,
+				Name:   key,
+				Status: proc.status,
+			})
+			if fix {
+				zombieKeys = append(zombieKeys, key)
+			}
+		}
+	}
+	if fix {
+		for _, key := range zombieKeys {
+			delete(m.processes, key)
+			m.store.DeleteProcess(key)
+			report.ZombiesFixed++
+		}
+	}
+	m.mu.Unlock()
+
+	// 2. Find orphan processes (listening on DPM port range but not managed)
+	// Collect all PIDs managed by DPM
+	m.mu.RLock()
+	managedPIDs := make(map[int]bool)
+	for _, proc := range m.processes {
+		if proc.pid > 0 {
+			managedPIDs[proc.pid] = true
+		}
+	}
+	m.mu.RUnlock()
+
+	// Parse /proc/net/tcp to find listening ports in DPM range (3000-6999)
+	orphans := findOrphanListeners(managedPIDs, 3000, 6999)
+	report.Orphans = orphans
+
+	if fix {
+		for _, orphan := range orphans {
+			if orphan.PID > 0 {
+				syscall.Kill(orphan.PID, syscall.SIGTERM)
+				report.OrphansFixed++
+			}
+		}
+		// Brief wait, then SIGKILL survivors
+		if report.OrphansFixed > 0 {
+			time.Sleep(2 * time.Second)
+			for _, orphan := range orphans {
+				if orphan.PID > 0 && processAlive(orphan.PID) {
+					syscall.Kill(orphan.PID, syscall.SIGKILL)
+				}
+			}
+		}
+	}
+
+	return report
+}
+
+// findOrphanListeners reads /proc/net/tcp to find processes listening
+// on ports in the given range that are NOT in the managedPIDs set.
+func findOrphanListeners(managedPIDs map[int]bool, portMin, portMax int) []DoctorEntry {
+	var orphans []DoctorEntry
+
+	data, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		return orphans
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines[1:] { // skip header
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+
+		// State 0A = LISTEN
+		if fields[3] != "0A" {
+			continue
+		}
+
+		// Parse local address (hex port)
+		addrParts := strings.Split(fields[1], ":")
+		if len(addrParts) != 2 {
+			continue
+		}
+		port64, err := strconv.ParseInt(addrParts[1], 16, 32)
+		if err != nil {
+			continue
+		}
+		port := int(port64)
+
+		if port < portMin || port > portMax {
+			continue
+		}
+
+		// Parse inode to find PID
+		inode := fields[9]
+		pid := findPIDByInode(inode)
+		if pid <= 0 {
+			continue
+		}
+
+		if !managedPIDs[pid] {
+			orphans = append(orphans, DoctorEntry{
+				PID:  pid,
+				Port: port,
+			})
+		}
+	}
+
+	return orphans
+}
+
+// findPIDByInode searches /proc/*/fd/ for a socket with the given inode.
+func findPIDByInode(inode string) int {
+	target := "socket:[" + inode + "]"
+
+	procDirs, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+
+	for _, d := range procDirs {
+		if !d.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(d.Name())
+		if err != nil {
+			continue
+		}
+
+		fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+		fds, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+
+		for _, fd := range fds {
+			link, err := os.Readlink(fmt.Sprintf("%s/%s", fdDir, fd.Name()))
+			if err != nil {
+				continue
+			}
+			if link == target {
+				return pid
+			}
+		}
+	}
+
+	return 0
+}
+
 // isContinuationLine detects stack trace and multi-line error continuation lines.
 func isContinuationLine(line string) bool {
 	if len(line) == 0 {

@@ -92,6 +92,7 @@ func NewRouter(
 	mux.HandleFunc("/api/v1/health", r.handleHealth)
 	mux.HandleFunc("/api/v1/version", r.handleVersion)
 	mux.HandleFunc("/api/v1/system/reload", r.handleReload)
+	mux.HandleFunc("/api/v1/system/doctor", r.handleDoctor)
 
 	// Wrap all handlers with panic recovery
 	return panicRecovery(mux, logger)
@@ -830,6 +831,23 @@ func (r *Router) handleReload(w http.ResponseWriter, req *http.Request) {
 		"restarted": restarted,
 		"failed":    failed,
 	})
+}
+
+func (r *Router) handleDoctor(w http.ResponseWriter, req *http.Request) {
+	fix := req.Method == http.MethodPost || req.URL.Query().Get("fix") == "true"
+
+	r.logger.Info("doctor check requested", "fix", fix)
+
+	report := r.pm.Doctor(fix)
+
+	r.logger.Info("doctor check completed",
+		"zombies", len(report.Zombies),
+		"orphans", len(report.Orphans),
+		"zombies_fixed", report.ZombiesFixed,
+		"orphans_fixed", report.OrphansFixed,
+	)
+
+	r.successResponse(w, report)
 }
 
 // --- Response helpers ---

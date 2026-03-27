@@ -54,6 +54,8 @@ func main() {
 		cmdPort(args)
 	case "nginx":
 		cmdNginx(args)
+	case "doctor":
+		cmdDoctor(args)
 	case "reload":
 		cmdReload()
 	case "upgrade":
@@ -435,6 +437,63 @@ func cmdPort(args []string) {
 	}
 }
 
+func cmdDoctor(args []string) {
+	fix := false
+	for _, a := range args {
+		if a == "--fix" {
+			fix = true
+		}
+	}
+
+	var resp []byte
+	if fix {
+		resp = apiPost("/api/v1/system/doctor?fix=true", nil)
+	} else {
+		resp = apiGet("/api/v1/system/doctor")
+	}
+
+	var result struct {
+		Data struct {
+			Zombies      []struct{ PID, Port int; Name, Status string } `json:"zombies"`
+			Orphans      []struct{ PID, Port int }                      `json:"orphans"`
+			ZombiesFixed int                                             `json:"zombies_fixed"`
+			OrphansFixed int                                             `json:"orphans_fixed"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		printJSON(resp)
+		return
+	}
+
+	d := result.Data
+	fmt.Println("=== DPM Health Check ===")
+	fmt.Println()
+
+	if len(d.Zombies) > 0 {
+		fmt.Printf("Zombie processes (%d):\n", len(d.Zombies))
+		for _, z := range d.Zombies {
+			fmt.Printf("  ⚠ %s (pid %d) - %s, port %d\n", z.Name, z.PID, z.Status, z.Port)
+		}
+	} else {
+		fmt.Println("✓ No zombie processes")
+	}
+
+	if len(d.Orphans) > 0 {
+		fmt.Printf("\nOrphan processes (%d):\n", len(d.Orphans))
+		for _, o := range d.Orphans {
+			fmt.Printf("  ⚠ PID %d listening on port %d (not managed by DPM)\n", o.PID, o.Port)
+		}
+	} else {
+		fmt.Println("✓ No orphan processes")
+	}
+
+	if fix {
+		fmt.Printf("\nFixed: %d zombies removed, %d orphans killed\n", d.ZombiesFixed, d.OrphansFixed)
+	} else if len(d.Zombies) > 0 || len(d.Orphans) > 0 {
+		fmt.Println("\nRun 'dpm doctor --fix' to clean up.")
+	}
+}
+
 func cmdReload() {
 	fmt.Println("Reloading all processes...")
 	resp := apiPost("/api/v1/system/reload", nil)
@@ -660,6 +719,7 @@ Usage: dpm <command> [options]
 Commands:
   start <config.yaml>       Start a new process
   deploy --config='<json>'  Blue-green deploy (zero-downtime)
+  doctor [--fix]            Health check: find zombies and orphans
   reload                    Kill all and restart from saved configs
   stop <name>               Stop a process
   restart <name>            Restart a process
