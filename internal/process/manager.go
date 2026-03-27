@@ -111,8 +111,10 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Stop existing instance if running
+	// Stop existing instance if running, carry forward restart count
+	previousRestarts := 0
 	if existing, ok := m.processes[key]; ok {
+		previousRestarts = existing.restarts
 		m.stopProcess(existing)
 	}
 
@@ -161,6 +163,7 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 		instance:  instance,
 		status:    StatusStarting,
 		startedAt: time.Now(),
+		restarts:  previousRestarts,
 		stopCh:    make(chan struct{}),
 	}
 
@@ -348,6 +351,77 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 		OldPorts: oldPorts,
 		Workers:  workerCount,
 	}, nil
+}
+
+// ReloadAll stops all processes and restarts them from saved configs.
+// This is the "emergency reset" - kills everything and starts fresh.
+// Returns (restarted count, failed count, error).
+func (m *Manager) ReloadAll() (int, int, error) {
+	// 1. Collect all unique process configs and their ports
+	type savedProcess struct {
+		cfg   *config.ProcessConfig
+		ports []int
+	}
+	saved := make(map[string]*savedProcess) // key: process name
+
+	m.mu.RLock()
+	for _, proc := range m.processes {
+		name := proc.config.Name
+		if _, ok := saved[name]; !ok {
+			saved[name] = &savedProcess{cfg: proc.config}
+		}
+		saved[name].ports = append(saved[name].ports, proc.port)
+	}
+	m.mu.RUnlock()
+
+	// Also check BoltDB for any processes not in memory
+	states, _ := m.store.ListProcesses()
+	for _, ps := range states {
+		// Extract base process name from instance key (e.g., "app_238:0" → "app_238")
+		baseName := ps.Name
+		if idx := strings.Index(ps.Name, ":"); idx > 0 {
+			baseName = ps.Name[:idx]
+		}
+		if _, ok := saved[baseName]; !ok {
+			var cfg config.ProcessConfig
+			if err := json.Unmarshal(ps.ConfigJSON, &cfg); err == nil && cfg.Name != "" {
+				saved[baseName] = &savedProcess{cfg: &cfg, ports: []int{ps.Port}}
+			}
+		}
+	}
+
+	if len(saved) == 0 {
+		return 0, 0, fmt.Errorf("no processes to reload")
+	}
+
+	// 2. Stop all running processes
+	m.mu.Lock()
+	for key, proc := range m.processes {
+		m.stopProcess(proc)
+		delete(m.processes, key)
+	}
+	m.mu.Unlock()
+
+	// 3. Clear all process state from BoltDB
+	for _, ps := range states {
+		m.store.DeleteProcess(ps.Name)
+	}
+
+	// Brief pause to let ports free
+	time.Sleep(1 * time.Second)
+
+	// 4. Restart each process from saved config
+	restarted := 0
+	failed := 0
+	for _, sp := range saved {
+		if err := m.Start(sp.cfg, sp.ports); err != nil {
+			failed++
+			continue
+		}
+		restarted++
+	}
+
+	return restarted, failed, nil
 }
 
 // Restart stops and starts a process.
@@ -600,6 +674,13 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 			shouldRestart = true
 		}
 	case "never":
+		shouldRestart = false
+	}
+
+	// Fast crash detection: if process lived less than 10s, lower tolerance
+	uptime := time.Since(proc.startedAt)
+	fastCrashLimit := 5
+	if uptime < 10*time.Second && proc.restarts >= fastCrashLimit {
 		shouldRestart = false
 	}
 

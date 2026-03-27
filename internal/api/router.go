@@ -91,6 +91,7 @@ func NewRouter(
 	mux.HandleFunc("/api/v1/status", r.handleStatus)
 	mux.HandleFunc("/api/v1/health", r.handleHealth)
 	mux.HandleFunc("/api/v1/version", r.handleVersion)
+	mux.HandleFunc("/api/v1/system/reload", r.handleReload)
 
 	// Wrap all handlers with panic recovery
 	return panicRecovery(mux, logger)
@@ -793,6 +794,28 @@ func (r *Router) handleVersion(w http.ResponseWriter, req *http.Request) {
 
 	r.successResponse(w, map[string]string{
 		"version": "dev",
+	})
+}
+
+func (r *Router) handleReload(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		r.methodNotAllowed(w)
+		return
+	}
+
+	r.logger.Info("reload-all requested")
+
+	restarted, failed, err := r.pm.ReloadAll()
+	if err != nil {
+		r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("reload failed: %v", err))
+		return
+	}
+
+	r.logger.Info("reload-all completed", "restarted", restarted, "failed", failed)
+
+	r.successResponse(w, map[string]interface{}{
+		"restarted": restarted,
+		"failed":    failed,
 	})
 }
 

@@ -54,6 +54,8 @@ func main() {
 		cmdPort(args)
 	case "nginx":
 		cmdNginx(args)
+	case "reload":
+		cmdReload()
 	case "upgrade":
 		cmdUpgrade(args)
 	case "version":
@@ -433,6 +435,12 @@ func cmdPort(args []string) {
 	}
 }
 
+func cmdReload() {
+	fmt.Println("Reloading all processes...")
+	resp := apiPost("/api/v1/system/reload", nil)
+	printJSON(resp)
+}
+
 func cmdUpgrade(args []string) {
 	targetVersion := ""
 	for _, a := range args {
@@ -652,6 +660,7 @@ Usage: dpm <command> [options]
 Commands:
   start <config.yaml>       Start a new process
   deploy --config='<json>'  Blue-green deploy (zero-downtime)
+  reload                    Kill all and restart from saved configs
   stop <name>               Stop a process
   restart <name>            Restart a process
   delete <name>             Stop and remove a process
