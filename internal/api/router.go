@@ -75,7 +75,6 @@ func NewRouter(
 
 	// Port endpoints
 	mux.HandleFunc("/api/v1/ports", r.handlePorts)
-	mux.HandleFunc("/api/v1/ports/allocate", r.handlePortAllocate)
 
 	// Nginx endpoints
 	mux.HandleFunc("/api/v1/nginx/apply", r.handleNginxApply)
@@ -183,53 +182,25 @@ func (r *Router) createProcess(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Allocate ports - use ResolveWorkerCount for cluster-aware count
-	workerCount := cfg.ResolveWorkerCount()
+	// Release old port allocations before starting
 
-	// Release old port allocations before allocating new ones
 	if err := r.ports.Release(cfg.Name); err != nil {
 		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
 	}
 
+	// Require explicit ports array from Depfloy - no auto-allocation
+	if len(cfg.Ports) == 0 {
+		r.errorResponse(w, http.StatusBadRequest, "ports array is required")
+		return
+	}
+
 	var ports []int
-	if len(cfg.Ports) > 0 {
-		// Explicit port list: use each port, fallback to auto if busy
-		for _, p := range cfg.Ports {
-			if r.ports.IsPortFree(p) {
-				ports = append(ports, p)
-			} else {
-				// Port busy - find a free alternative
-				alt, err := r.ports.Allocate(cfg.Name, cfg.Type, 1)
-				if err != nil {
-					r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("no free fallback port: %v", err))
-					return
-				}
-				ports = append(ports, alt[0])
-				r.logger.Warn("port busy, using fallback", "wanted", p, "got", alt[0], "process", cfg.Name)
-			}
-		}
-	} else if cfg.Port == "auto" {
-		allocated, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount)
-		if err != nil {
-			r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("port allocation failed: %v", err))
+	for _, p := range cfg.Ports {
+		if !r.ports.IsPortFree(p) {
+			r.errorResponse(w, http.StatusConflict, fmt.Sprintf("port %d is busy, cannot start process", p))
 			return
 		}
-		ports = allocated
-	} else if cfg.Port != "" {
-		p, err := strconv.Atoi(cfg.Port)
-		if err != nil {
-			r.errorResponse(w, http.StatusBadRequest, "port must be 'auto' or a number")
-			return
-		}
-		ports = []int{p}
-		if workerCount > 1 {
-			additional, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount-1)
-			if err != nil {
-				r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("additional port allocation failed: %v", err))
-				return
-			}
-			ports = append(ports, additional...)
-		}
+		ports = append(ports, p)
 	}
 
 	// Start process
@@ -293,8 +264,7 @@ func (r *Router) startProcess(w http.ResponseWriter, name string) {
 		return
 	}
 
-	ports, _ := r.ports.GetByProcess(name)
-	if err := r.pm.Start(cfg, ports); err != nil {
+	if err := r.pm.Start(cfg, cfg.Ports); err != nil {
 		r.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -329,31 +299,19 @@ func (r *Router) deployProcess(w http.ResponseWriter, req *http.Request) {
 		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
 	}
 
-	// Allocate new ports
-	workerCount := cfg.ResolveWorkerCount()
+	// Require explicit ports array from Depfloy - no auto-allocation
+	if len(cfg.Ports) == 0 {
+		r.errorResponse(w, http.StatusBadRequest, "ports array is required")
+		return
+	}
+
 	var newPorts []int
-	if cfg.Port == "auto" {
-		allocated, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount)
-		if err != nil {
-			r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("port allocation failed: %v", err))
+	for _, p := range cfg.Ports {
+		if !r.ports.IsPortFree(p) {
+			r.errorResponse(w, http.StatusConflict, fmt.Sprintf("port %d is busy, cannot start process", p))
 			return
 		}
-		newPorts = allocated
-	} else if cfg.Port != "" {
-		p, err := strconv.Atoi(cfg.Port)
-		if err != nil {
-			r.errorResponse(w, http.StatusBadRequest, "port must be 'auto' or a number")
-			return
-		}
-		newPorts = []int{p}
-		if workerCount > 1 {
-			additional, err := r.ports.Allocate(cfg.Name, cfg.Type, workerCount-1)
-			if err != nil {
-				r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("additional port allocation failed: %v", err))
-				return
-			}
-			newPorts = append(newPorts, additional...)
-		}
+		newPorts = append(newPorts, p)
 	}
 
 	// Blue-green deploy: start new workers, wait for online, then drain old
@@ -403,35 +361,6 @@ func (r *Router) handlePorts(w http.ResponseWriter, req *http.Request) {
 	}
 
 	r.successResponse(w, allocations)
-}
-
-func (r *Router) handlePortAllocate(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		r.methodNotAllowed(w)
-		return
-	}
-
-	var body struct {
-		ProcessName string `json:"process_name"`
-		Type        string `json:"type"`
-		Count       int    `json:"count"`
-	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		r.errorResponse(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if body.Count <= 0 {
-		body.Count = 1
-	}
-
-	ports, err := r.ports.Allocate(body.ProcessName, body.Type, body.Count)
-	if err != nil {
-		r.errorResponse(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	r.successResponse(w, map[string]interface{}{"ports": ports})
 }
 
 // --- Log Handlers ---

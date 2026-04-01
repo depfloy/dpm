@@ -18,8 +18,6 @@ type DaemonConfig struct {
 
 	User string `yaml:"user"`
 
-	Ports PortRanges `yaml:"ports"`
-
 	Logging LoggingConfig `yaml:"logging"`
 
 	Nginx NginxConfig `yaml:"nginx"`
@@ -29,13 +27,6 @@ type DaemonConfig struct {
 	State struct {
 		Dir string `yaml:"dir"`
 	} `yaml:"state"`
-}
-
-// PortRanges defines port allocation ranges by process type.
-type PortRanges struct {
-	NodeJS  [2]int `yaml:"nodejs"`
-	Plugins [2]int `yaml:"plugins"`
-	Workers [2]int `yaml:"workers"`
 }
 
 // LoggingConfig defines log rotation and format settings.
@@ -75,9 +66,8 @@ type ProcessConfig struct {
 	CWD     string `yaml:"cwd" json:"cwd"`
 	User    string `yaml:"user,omitempty" json:"user,omitempty"`
 
-	Instances int    `yaml:"instances,omitempty" json:"instances,omitempty"`
-	Port      string `yaml:"port,omitempty" json:"port,omitempty"` // "auto" or specific port number
-	Ports     []int  `yaml:"ports,omitempty" json:"ports,omitempty"` // Explicit port list for all workers
+	Instances int   `yaml:"instances,omitempty" json:"instances,omitempty"`
+	Ports     []int `yaml:"ports,omitempty" json:"ports,omitempty"` // Explicit port list from Depfloy
 
 	// Cluster mode: "auto" uses CPU cores, "fixed" uses Instances count.
 	// When set, all workers are active (no backup). Empty = legacy 2-instance mode.
@@ -152,9 +142,6 @@ func DefaultDaemonConfig() *DaemonConfig {
 	cfg.Daemon.PIDFile = "/var/run/dpm/dpm.pid"
 	cfg.Daemon.LogFile = "/var/log/dpm/daemon.log"
 	cfg.User = "depfloy"
-	cfg.Ports.NodeJS = [2]int{3000, 4999}
-	cfg.Ports.Plugins = [2]int{5000, 5999}
-	cfg.Ports.Workers = [2]int{6000, 6999}
 	cfg.Logging.Format = "json"
 	cfg.Logging.Dir = "/var/log/dpm"
 	cfg.Logging.Rotation.MaxSize = "100MB"

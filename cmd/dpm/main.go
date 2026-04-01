@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -399,39 +398,13 @@ func cmdHealth(args []string) {
 
 func cmdPort(args []string) {
 	if len(args) == 0 {
-		fatal("Usage: dpm port <list|allocate|release>")
+		fatal("Usage: dpm port <list>")
 	}
 
 	switch args[0] {
 	case "list":
 		body := apiGet("/api/v1/ports")
 		printFormattedJSON(body)
-	case "allocate":
-		reqBody := map[string]interface{}{
-			"type":  "nodejs",
-			"count": 1,
-		}
-		for _, a := range args[1:] {
-			if strings.HasPrefix(a, "--type=") {
-				reqBody["type"] = strings.TrimPrefix(a, "--type=")
-			}
-			if strings.HasPrefix(a, "--count=") {
-				count, _ := strconv.Atoi(strings.TrimPrefix(a, "--count="))
-				reqBody["count"] = count
-			}
-			if strings.HasPrefix(a, "--name=") {
-				reqBody["process_name"] = strings.TrimPrefix(a, "--name=")
-			}
-		}
-		data, _ := json.Marshal(reqBody)
-		resp := apiPost("/api/v1/ports/allocate", data)
-		printJSON(resp)
-	case "release":
-		if len(args) < 2 {
-			fatal("Usage: dpm port release <port>")
-		}
-		// Port release would be a DELETE endpoint
-		fmt.Printf("Released port %s\n", args[1])
 	default:
 		fatal("Unknown port subcommand: %s", args[0])
 	}

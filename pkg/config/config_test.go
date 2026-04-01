@@ -15,9 +15,6 @@ func TestDefaultDaemonConfig(t *testing.T) {
 	if cfg.User != "depfloy" {
 		t.Errorf("User = %s, want depfloy", cfg.User)
 	}
-	if cfg.Ports.NodeJS[0] != 3000 || cfg.Ports.NodeJS[1] != 4999 {
-		t.Errorf("NodeJS ports = %v, want [3000, 4999]", cfg.Ports.NodeJS)
-	}
 	if cfg.HealthCheck.Retries != 3 {
 		t.Errorf("Retries = %d, want 3", cfg.HealthCheck.Retries)
 	}
@@ -33,11 +30,6 @@ daemon:
   log_file: /tmp/test.log
 
 user: testuser
-
-ports:
-  nodejs: [4000, 4999]
-  plugins: [5000, 5099]
-  workers: [6000, 6099]
 
 logging:
   format: text
@@ -66,9 +58,6 @@ health_check:
 	}
 	if cfg.User != "testuser" {
 		t.Errorf("User = %s, want testuser", cfg.User)
-	}
-	if cfg.Ports.NodeJS[0] != 4000 {
-		t.Errorf("NodeJS start = %d, want 4000", cfg.Ports.NodeJS[0])
 	}
 	if cfg.Nginx.Mode != "managed" {
 		t.Errorf("Nginx mode = %s, want managed", cfg.Nginx.Mode)
@@ -99,7 +88,7 @@ name: my-app
 command: npm run start
 cwd: /home/depfloy/42/current
 instances: 2
-port: auto
+ports: [3000, 3001]
 env:
   NODE_ENV: production
 health_check:
@@ -127,8 +116,8 @@ resources:
 	if cfg.Instances != 2 {
 		t.Errorf("Instances = %d, want 2", cfg.Instances)
 	}
-	if cfg.Port != "auto" {
-		t.Errorf("Port = %s, want auto", cfg.Port)
+	if len(cfg.Ports) != 2 || cfg.Ports[0] != 3000 || cfg.Ports[1] != 3001 {
+		t.Errorf("Ports = %v, want [3000, 3001]", cfg.Ports)
 	}
 	if cfg.Env["NODE_ENV"] != "production" {
 		t.Errorf("NODE_ENV = %s, want production", cfg.Env["NODE_ENV"])
