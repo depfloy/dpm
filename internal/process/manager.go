@@ -785,6 +785,7 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 }
 
 // monitorAdopted watches an adopted process (no cmd reference).
+// If the process dies, it restarts from saved config.
 func (m *Manager) monitorAdopted(proc *managed, key string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -797,14 +798,16 @@ func (m *Manager) monitorAdopted(proc *managed, key string) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// processAlive check does NOT need mutex - it's a read-only syscall
 		if !processAlive(proc.pid) {
-			// Process died - just mark as stopped, don't restart
-			// Restart will happen on next deploy
-			proc.status = StatusStopped
+			// Process died - restart from saved config
 			m.mu.Lock()
-			m.persistProcess(proc, key)
+			delete(m.processes, key)
 			m.mu.Unlock()
+
+			// Restart from saved config
+			if proc.config != nil && proc.config.Name != "" {
+				m.startInstance(proc.config, key, proc.instance, proc.port)
+			}
 			return
 		}
 	}
