@@ -1,12 +1,14 @@
 package daemon
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/depfloy/dpm/internal/api"
@@ -139,6 +141,7 @@ func (d *Daemon) Run() error {
 }
 
 // adoptOrphans re-attaches processes that survived a daemon restart.
+// Dead processes are automatically restarted from their saved config.
 func (d *Daemon) adoptOrphans() error {
 	processes, err := d.store.ListProcesses()
 	if err != nil {
@@ -153,6 +156,13 @@ func (d *Daemon) adoptOrphans() error {
 	adopted := 0
 	restarted := 0
 	cleaned := 0
+
+	// Collect dead processes for restart (deduplicated by base name)
+	type restartInfo struct {
+		cfg  *config.ProcessConfig
+		port int
+	}
+	toRestart := make(map[string]*restartInfo) // key: base process name
 
 	for _, ps := range processes {
 		// Clean up processes that exceeded max restarts or are in error state
@@ -171,7 +181,6 @@ func (d *Daemon) adoptOrphans() error {
 		}
 
 		if ps.PID <= 0 {
-			// No PID - remove from state
 			d.store.DeleteProcess(ps.Name)
 			if ps.Port > 0 {
 				d.portManager.ReleasePort(ps.Port)
@@ -200,16 +209,47 @@ func (d *Daemon) adoptOrphans() error {
 				"pid", ps.PID,
 			)
 		} else {
-			// Process is dead - remove from state, don't auto-restart
-			// Restart will happen on next deploy or manual dpm start
+			// Process is dead - collect for restart from saved config
 			d.store.DeleteProcess(ps.Name)
 			if ps.Port > 0 {
 				d.portManager.ReleasePort(ps.Port)
 			}
+
+			// Extract base name from instance key (e.g., "app_243:0" → "app_243")
+			baseName := ps.Name
+			if idx := strings.Index(ps.Name, ":"); idx > 0 {
+				baseName = ps.Name[:idx]
+			}
+
+			// Only collect once per base name
+			if _, exists := toRestart[baseName]; !exists {
+				var cfg config.ProcessConfig
+				if err := json.Unmarshal(ps.ConfigJSON, &cfg); err == nil && cfg.Name != "" {
+					toRestart[baseName] = &restartInfo{cfg: &cfg, port: ps.Port}
+					d.logger.Info("will restart dead process",
+						"name", baseName,
+						"port", ps.Port,
+					)
+				} else {
+					cleaned++
+				}
+			}
+		}
+	}
+
+	// Restart dead processes from saved configs
+	for name, r := range toRestart {
+		if err := d.processManager.Start(r.cfg, []int{r.port}); err != nil {
+			d.logger.Error("failed to restart dead process",
+				"name", name,
+				"error", err,
+			)
 			cleaned++
-			d.logger.Info("removed dead process from state",
-				"name", ps.Name,
-				"pid", ps.PID,
+		} else {
+			restarted++
+			d.logger.Info("restarted dead process",
+				"name", name,
+				"port", r.port,
 			)
 		}
 	}
