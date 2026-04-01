@@ -89,7 +89,11 @@ func (m *Manager) OnStatusChange(fn func(name, status string)) {
 // For cluster mode, starts workers based on CPU cores.
 // For legacy mode, starts based on Instances count.
 func (m *Manager) Start(cfg *config.ProcessConfig, ports []int) error {
-	workerCount := cfg.ResolveWorkerCount()
+	// Worker count is determined by explicit ports array length
+	workerCount := len(ports)
+	if workerCount == 0 {
+		workerCount = cfg.ResolveWorkerCount()
+	}
 
 	// Stop ALL existing instances for this process name before starting new ones.
 	// This handles the case where worker count changed (e.g., cluster→single).
