@@ -34,12 +34,7 @@ func testDaemonComponents(t *testing.T) (*state.Store, *process.Manager, *port.M
 
 	pm := process.NewManager(store, logDir, rotation)
 
-	portRanges := config.PortRanges{
-		NodeJS:  [2]int{11000, 11099},
-		Plugins: [2]int{11100, 11199},
-		Workers: [2]int{11200, 11299},
-	}
-	portMgr := port.NewManager(store, portRanges)
+	portMgr := port.NewManager(store)
 
 	return store, pm, portMgr
 }

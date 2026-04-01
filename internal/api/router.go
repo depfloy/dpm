@@ -182,18 +182,24 @@ func (r *Router) createProcess(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Release old port allocations before starting
-
-	if err := r.ports.Release(cfg.Name); err != nil {
-		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
-	}
-
 	// Require explicit ports array from Depfloy - no auto-allocation
 	if len(cfg.Ports) == 0 {
 		r.errorResponse(w, http.StatusBadRequest, "ports array is required")
 		return
 	}
 
+	// Stop existing process BEFORE port check - the old process is likely
+	// holding the same ports we want to reuse
+	if err := r.pm.Stop(cfg.Name); err != nil {
+		r.logger.Debug("no existing process to stop", "name", cfg.Name)
+	}
+
+	// Release old port allocations from state store
+	if err := r.ports.Release(cfg.Name); err != nil {
+		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
+	}
+
+	// Now check port availability - ports should be free after stopping old process
 	var ports []int
 	for _, p := range cfg.Ports {
 		if !r.ports.IsPortFree(p) {
@@ -294,17 +300,24 @@ func (r *Router) deployProcess(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Release old port allocations
-	if err := r.ports.Release(cfg.Name); err != nil {
-		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
-	}
-
 	// Require explicit ports array from Depfloy - no auto-allocation
 	if len(cfg.Ports) == 0 {
 		r.errorResponse(w, http.StatusBadRequest, "ports array is required")
 		return
 	}
 
+	// Stop existing process BEFORE port check - the old process is likely
+	// holding the same ports we want to reuse
+	if err := r.pm.Stop(cfg.Name); err != nil {
+		r.logger.Debug("no existing process to stop", "name", cfg.Name)
+	}
+
+	// Release old port allocations from state store
+	if err := r.ports.Release(cfg.Name); err != nil {
+		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
+	}
+
+	// Now check port availability - ports should be free after stopping old process
 	var newPorts []int
 	for _, p := range cfg.Ports {
 		if !r.ports.IsPortFree(p) {
