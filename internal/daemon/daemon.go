@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/depfloy/dpm/internal/api"
@@ -62,53 +60,17 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 	hc := health.NewChecker()
 	nginxMgr := nginx.NewManager(cfg.Nginx.ConfigDir, cfg.Nginx.ReloadCommand, pm)
 
-	// Wire up health check → nginx upstream integration
+	// Health check callbacks - log only, nginx is managed by Depfloy
 	hc.OnUnhealthy(func(name string, status *health.Status) {
-		logger.Warn("process unhealthy - removing from upstream",
+		logger.Warn("process unhealthy",
 			"name", name,
 			"message", status.Message,
 			"consecutive_failures", status.Consecutive,
 		)
-		// Find process info to get port and domain
-		infos, err := pm.GetInfo(name)
-		if err == nil && len(infos) > 0 && infos[0].Port > 0 {
-			// Find nginx config for this process (sites-enabled files)
-			entries, _ := os.ReadDir(filepath.Join(cfg.Nginx.ConfigDir, "sites-enabled"))
-			for _, e := range entries {
-				configPath := filepath.Join(cfg.Nginx.ConfigDir, "sites-available", e.Name())
-				data, _ := os.ReadFile(configPath)
-				if strings.Contains(string(data), fmt.Sprintf("upstream_%s", strings.Split(name, ":")[0])) {
-					if err := nginxMgr.MarkWorkerDown(e.Name(), infos[0].Port); err != nil {
-						logger.Error("failed to remove unhealthy worker from upstream", "error", err)
-					} else {
-						logger.Info("removed unhealthy worker from upstream", "name", name, "port", infos[0].Port)
-					}
-					break
-				}
-			}
-		}
 	})
 
 	hc.OnHealthy(func(name string, status *health.Status) {
-		logger.Info("process recovered - adding back to upstream",
-			"name", name,
-		)
-		infos, err := pm.GetInfo(name)
-		if err == nil && len(infos) > 0 && infos[0].Port > 0 {
-			entries, _ := os.ReadDir(filepath.Join(cfg.Nginx.ConfigDir, "sites-enabled"))
-			for _, e := range entries {
-				configPath := filepath.Join(cfg.Nginx.ConfigDir, "sites-available", e.Name())
-				data, _ := os.ReadFile(configPath)
-				if strings.Contains(string(data), fmt.Sprintf("upstream_%s", strings.Split(name, ":")[0])) {
-					if err := nginxMgr.MarkWorkerUp(e.Name(), infos[0].Port); err != nil {
-						logger.Error("failed to add recovered worker to upstream", "error", err)
-					} else {
-						logger.Info("added recovered worker to upstream", "name", name, "port", infos[0].Port)
-					}
-					break
-				}
-			}
-		}
+		logger.Info("process recovered", "name", name)
 	})
 
 	pm.OnStatusChange(func(name, status string) {
