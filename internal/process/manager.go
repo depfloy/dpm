@@ -797,18 +797,30 @@ func (m *Manager) monitorAdopted(proc *managed, key string) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if !processAlive(proc.pid) {
-			// Process died - restart from saved config
-			m.mu.Lock()
-			delete(m.processes, key)
-			m.mu.Unlock()
-
-			// Restart from saved config
-			if proc.config != nil && proc.config.Name != "" {
-				m.startInstance(proc.config, key, proc.instance, proc.port)
-			}
+	for {
+		select {
+		case <-proc.stopCh:
+			// Intentional stop - do NOT restart
 			return
+		case <-ticker.C:
+			if !processAlive(proc.pid) {
+				// Check if intentionally stopped
+				select {
+				case <-proc.stopCh:
+					return
+				default:
+				}
+
+				// Process died unexpectedly - restart from saved config
+				m.mu.Lock()
+				delete(m.processes, key)
+				m.mu.Unlock()
+
+				if proc.config != nil && proc.config.Name != "" {
+					m.startInstance(proc.config, key, proc.instance, proc.port)
+				}
+				return
+			}
 		}
 	}
 }
