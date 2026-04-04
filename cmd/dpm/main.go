@@ -33,6 +33,8 @@ func main() {
 		cmdStart(args)
 	case "deploy":
 		cmdDeploy(args)
+	case "drain":
+		cmdDrain(args)
 	case "stop":
 		cmdStop(args)
 	case "restart":
@@ -127,6 +129,14 @@ func cmdDeploy(args []string) {
 	}
 
 	resp := apiPost(fmt.Sprintf("/api/v1/processes/%s/deploy", cfg.Name), body)
+	printJSON(resp)
+}
+
+func cmdDrain(args []string) {
+	if len(args) == 0 {
+		fatal("Usage: dpm drain <name>")
+	}
+	resp := apiPost(fmt.Sprintf("/api/v1/processes/%s/drain", args[0]), nil)
 	printJSON(resp)
 }
 
@@ -692,6 +702,7 @@ Usage: dpm <command> [options]
 Commands:
   start <config.yaml>       Start a new process
   deploy --config='<json>'  Blue-green deploy (zero-downtime)
+  drain <name>              Stop old workers parked during deploy
   doctor [--fix]            Health check: find zombies and orphans
   reload                    Kill all and restart from saved configs
   stop <name>               Stop a process

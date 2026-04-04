@@ -458,9 +458,37 @@ func TestDeployBlueGreen(t *testing.T) {
 	}
 	mgr.mu.RUnlock()
 
-	// Clean up (old workers will be drained in background)
-	time.Sleep(2 * time.Second) // Wait for drain timeout
+	// Verify old workers are in pendingDrain (not auto-killed)
+	mgr.mu.RLock()
+	pendingCount := len(mgr.pendingDrain["deploy-app"])
+	mgr.mu.RUnlock()
+	if pendingCount != 1 {
+		t.Errorf("pendingDrain count = %d, want 1", pendingCount)
+	}
+
+	// Drain old workers explicitly
+	if err := mgr.Drain("deploy-app"); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	// Verify pendingDrain is empty after drain
+	mgr.mu.RLock()
+	pendingAfter := len(mgr.pendingDrain["deploy-app"])
+	mgr.mu.RUnlock()
+	if pendingAfter != 0 {
+		t.Errorf("pendingDrain after drain = %d, want 0", pendingAfter)
+	}
+
 	mgr.Stop("deploy-app")
+}
+
+func TestDrainNoOp(t *testing.T) {
+	mgr, _ := testManager(t)
+
+	// Drain on non-existent process should not error
+	if err := mgr.Drain("nonexistent"); err != nil {
+		t.Errorf("drain nonexistent: %v", err)
+	}
 }
 
 // ==================== startInstance Error Handling in Monitor ====================
@@ -890,3 +918,4 @@ func (w *bufWriter) Write(p []byte) (int, error) {
 	*w.buf = append(*w.buf, p...)
 	return len(p), nil
 }
+

@@ -160,6 +160,8 @@ func (r *Router) handleProcess(w http.ResponseWriter, req *http.Request) {
 		r.restartProcess(w, name)
 	case action == "deploy" && req.Method == http.MethodPost:
 		r.deployProcess(w, req)
+	case action == "drain" && req.Method == http.MethodPost:
+		r.drainProcess(w, name)
 	default:
 		r.methodNotAllowed(w)
 	}
@@ -306,28 +308,17 @@ func (r *Router) deployProcess(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Stop existing process BEFORE port check - the old process is likely
-	// holding the same ports we want to reuse
-	if err := r.pm.Stop(cfg.Name); err != nil {
-		r.logger.Debug("no existing process to stop", "name", cfg.Name)
-	}
-
-	// Release old port allocations from state store
-	if err := r.ports.Release(cfg.Name); err != nil {
-		r.logger.Warn("failed to release old ports", "name", cfg.Name, "error", err)
-	}
-
-	// Now check port availability - ports should be free after stopping old process
+	// Check new port availability (old ports are still in use by running process)
 	var newPorts []int
 	for _, p := range cfg.Ports {
 		if !r.ports.IsPortFree(p) {
-			r.errorResponse(w, http.StatusConflict, fmt.Sprintf("port %d is busy, cannot start process", p))
+			r.errorResponse(w, http.StatusConflict, fmt.Sprintf("port %d is busy, cannot deploy", p))
 			return
 		}
 		newPorts = append(newPorts, p)
 	}
 
-	// Blue-green deploy: start new workers, wait for online, then drain old
+	// Blue-green deploy: start new workers while old ones keep serving
 	result, err := r.pm.Deploy(&cfg, newPorts)
 	if err != nil {
 		r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("deploy failed: %v", err))
@@ -347,6 +338,16 @@ func (r *Router) deployProcess(w http.ResponseWriter, req *http.Request) {
 	)
 
 	r.successResponse(w, result)
+}
+
+func (r *Router) drainProcess(w http.ResponseWriter, name string) {
+	if err := r.pm.Drain(name); err != nil {
+		r.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("drain failed: %v", err))
+		return
+	}
+
+	r.logger.Info("old workers drained", "name", name)
+	r.successResponse(w, map[string]string{"drained": name})
 }
 
 func (r *Router) restartProcess(w http.ResponseWriter, name string) {

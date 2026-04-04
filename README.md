@@ -1,13 +1,13 @@
 # DPM - Depfloy Process Manager
 
-DPM is a lightweight process manager built for production Linux servers. It manages long-running application processes (Node.js, workers, plugins) with automatic port allocation, health checking, cluster mode, and zero-downtime deployments. DPM runs as a systemd service and exposes a Unix socket API that the `dpm` CLI consumes.
+DPM is a lightweight process manager built for production Linux servers. It manages long-running application processes (Node.js, workers, plugins) with health checking, multi-worker support, and zero-downtime blue-green deployments. DPM runs as a systemd service and exposes a Unix socket API that the `dpm` CLI consumes.
 
 ## Key Features
 
 - **Process lifecycle management** -- start, stop, restart, and delete processes with automatic restart policies and exponential backoff
-- **Automatic port allocation** -- assigns ports from configurable ranges (Node.js 3000-4999, plugins 5000-5999, workers 6000-6999) with conflict detection
-- **Cluster mode** -- run multiple workers per process with `auto` (CPU cores - 1) or `fixed` count, load balancing via nginx upstream (least_conn, round_robin, ip_hash)
-- **Zero-downtime deployments** -- atomic symlink swap with rolling restarts in batches; automatic rollback on health check failure
+- **Multi-worker support** -- run multiple workers per process on explicit ports, with nginx upstream load balancing (least_conn, round_robin, ip_hash)
+- **Rolling restart** -- restarts workers one at a time while others continue serving traffic; new ports are started first, then existing ports are cycled sequentially for true zero-downtime
+- **Blue-green deployments** -- start new workers on different ports, verify health, then drain old workers with configurable timeout
 - **Health checks** -- HTTP, TCP, or exec-based checks with configurable thresholds and intervals
 - **Connection draining** -- graceful shutdown waits for active requests to complete before stopping workers
 - **Persistent state** -- BoltDB-backed state survives daemon restarts; orphan processes are re-adopted automatically
@@ -49,8 +49,7 @@ name: my-app
 type: nodejs
 command: node server.js
 cwd: /home/depfloy/my-app/current
-port: auto
-instances: 1
+ports: [3000, 3001]
 
 env:
   NODE_ENV: production
@@ -92,15 +91,16 @@ my-app    nodejs  online  12345  3000  48.2 MB   2h 15m  0
 | `dpm start --config='<json>'` | Start a new process from inline JSON |
 | `dpm stop <name>` | Stop a running process and all its instances |
 | `dpm restart <name>` | Stop and restart a process, preserving port assignments |
+| `dpm deploy --config='<json>'` | Blue-green deploy: start new workers on new ports while old keep serving |
+| `dpm drain <name>` | Stop old workers parked during blue-green deploy |
 | `dpm delete <name>` | Stop and remove a process from management |
 | `dpm list` | List all managed processes in a table |
 | `dpm list --json` | List all managed processes as JSON |
 | `dpm info <name>` | Show detailed information about a process |
-| `dpm status` | Show daemon status (total/online processes, allocated ports) |
+| `dpm status` | Show daemon status (total/online processes) |
 | `dpm health` | Check health of all processes |
 | `dpm health --json` | Health check output as JSON |
 | `dpm port list` | List all port allocations |
-| `dpm port allocate` | Allocate ports manually (`--type=`, `--count=`, `--name=`) |
 | `dpm port release <port>` | Release a port allocation |
 | `dpm upgrade --version=<ver>` | Upgrade DPM to a specific version |
 | `dpm upgrade --rollback` | Roll back to the previous DPM binary |
@@ -124,11 +124,6 @@ daemon:
   log_file: /var/log/dpm/daemon.log
 
 user: depfloy
-
-ports:
-  nodejs: [3000, 4999]
-  plugins: [5000, 5999]
-  workers: [6000, 6999]
 
 logging:
   format: json
@@ -162,8 +157,7 @@ name: my-api
 type: nodejs                    # nodejs, php, static, worker
 command: node dist/server.js
 cwd: /home/depfloy/my-api/current
-port: auto                      # "auto" or a specific port number
-instances: 1
+ports: [3000, 3001]             # Explicit port list
 
 env:
   NODE_ENV: production
@@ -179,24 +173,12 @@ health_check:
 
 resources:
   max_memory: 512MB
-  max_cpu: 2
 
 restart_policy: always          # always, on-failure, never
 restart_delay: 1s
 max_restarts: 10
 stop_signal: SIGTERM            # SIGTERM, SIGKILL, SIGINT, SIGQUIT
 stop_timeout: 10s
-
-nginx:
-  domains: [api.example.com]
-  ssl: auto
-  websocket: true
-
-workers:
-  - name: queue-worker
-    command: node worker.js
-    port: auto
-    restart_on_deploy: true
 ```
 
 ## Cluster Mode
@@ -208,16 +190,18 @@ name: my-api
 type: nodejs
 command: node dist/server.js
 cwd: /home/depfloy/my-api/current
-port: auto
+ports: [3000, 3001, 3002, 3003]
 
 cluster:
-  mode: auto                    # auto: CPU cores - 1 (min 2), fixed: use workers count
-  workers: 4                    # Used when mode is "fixed"
+  mode: fixed
+  workers: 4
   strategy: least_conn          # least_conn (default), round_robin, ip_hash
   drain_timeout: 30s            # Time to wait for active requests during shutdown
 ```
 
 ### Worker Count Resolution
+
+Worker count is determined by the `ports` array length. Each port gets one worker instance.
 
 | Mode | Behavior |
 |------|----------|
@@ -234,15 +218,16 @@ cluster:
 
 ### Zero-Downtime Deployments
 
-During a deploy, DPM performs an atomic symlink swap followed by a rolling restart:
+DPM uses blue-green deployment for zero-downtime:
 
-1. Validate the new release directory exists
-2. Read the current symlink target (saved for rollback)
-3. Atomically swap the symlink to the new release
-4. Rolling restart workers in two batches (cluster mode) or one-by-one (legacy mode)
-5. Run health checks after each batch -- if a check fails, automatically roll back
+**Blue-green deploy** (`dpm deploy`) -- starts new workers on different ports while old workers continue serving traffic. Old workers are kept alive until the caller explicitly drains them with `dpm drain`.
 
-Connection draining ensures in-flight requests complete before workers are stopped. The drain timeout defaults to 30 seconds and is configurable via `cluster.drain_timeout`.
+1. Start new workers on new ports (old workers still running)
+2. Wait for all new workers to come online (max 30s, automatic rollback on failure)
+3. Promote new workers, park old workers in pending drain state
+4. Caller updates nginx to point to new ports, then calls `dpm drain <name>` to stop old workers
+
+This gives the orchestrator (Depfloy) full control over when old workers are stopped, enabling instant rollback by simply switching nginx back to the old port before draining.
 
 ## systemd Service
 

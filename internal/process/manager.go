@@ -60,6 +60,7 @@ type managed struct {
 type Manager struct {
 	mu             sync.RWMutex
 	processes      map[string]*managed // key: "name" or "name:instance"
+	pendingDrain   map[string][]*managed // old workers awaiting explicit drain
 	store          *state.Store
 	logDir         string
 	maxLogSize     int64
@@ -71,12 +72,13 @@ type Manager struct {
 // NewManager creates a new process manager.
 func NewManager(store *state.Store, logDir string, rotation config.RotationConfig) *Manager {
 	return &Manager{
-		processes:     make(map[string]*managed),
-		store:         store,
-		logDir:        logDir,
-		maxLogSize:    dpmlog.ParseMaxSize(rotation.MaxSize),
+		processes:    make(map[string]*managed),
+		pendingDrain: make(map[string][]*managed),
+		store:        store,
+		logDir:       logDir,
+		maxLogSize:   dpmlog.ParseMaxSize(rotation.MaxSize),
 		maxLogBackups: rotation.MaxBackups,
-		logCompress:   rotation.Compress,
+		logCompress:  rotation.Compress,
 	}
 }
 
@@ -98,15 +100,25 @@ func (m *Manager) Start(cfg *config.ProcessConfig, ports []int) error {
 	// Stop ALL existing instances for this process name before starting new ones.
 	// This handles the case where worker count changed (e.g., cluster→single).
 	// Old keys like "app_238:0", "app_238:1" won't match new key "app_238".
+	// Collect first, then stop WITHOUT holding the mutex to avoid blocking the daemon.
+	type toStop struct {
+		key  string
+		proc *managed
+	}
+	var stopping []toStop
 	m.mu.Lock()
 	for key, proc := range m.processes {
 		if proc.config.Name == cfg.Name {
-			m.stopProcess(proc)
+			stopping = append(stopping, toStop{key, proc})
 			delete(m.processes, key)
 			m.store.DeleteProcess(key)
 		}
 	}
 	m.mu.Unlock()
+
+	for _, s := range stopping {
+		m.stopProcess(s.proc)
+	}
 
 	for i := 0; i < workerCount; i++ {
 		key := instanceKey(cfg.Name, i, workerCount)
@@ -329,8 +341,6 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 	}
 
 	// 4. Promote: swap deploy keys to final keys
-	drainTimeout := resolveTimeout(cfg.DrainTimeout(), 30*time.Second)
-
 	m.mu.Lock()
 	// Collect old workers for deferred cleanup
 	type oldWorker struct {
@@ -358,15 +368,16 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 	}
 	m.mu.Unlock()
 
-	// 5. Graceful shutdown of old workers in background after drain timeout
-	// This gives the caller time to update nginx with new ports
-	go func() {
-		time.Sleep(drainTimeout)
+	// 5. Store old workers for explicit drain by caller (Depfloy)
+	// Old workers keep running until Drain() is called after nginx switch
+	if len(oldWorkers) > 0 {
+		m.mu.Lock()
 		for _, ow := range oldWorkers {
-			m.stopProcess(ow.proc)
+			m.pendingDrain[cfg.Name] = append(m.pendingDrain[cfg.Name], ow.proc)
 			m.store.DeleteProcess(ow.key)
 		}
-	}()
+		m.mu.Unlock()
+	}
 
 	return &DeployResult{
 		Status:   "success",
@@ -374,6 +385,26 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 		OldPorts: oldPorts,
 		Workers:  workerCount,
 	}, nil
+}
+
+// Drain stops old workers that were parked during a blue-green deploy.
+// Called by Depfloy after nginx has been switched to the new port.
+func (m *Manager) Drain(name string) error {
+	m.mu.Lock()
+	workers, ok := m.pendingDrain[name]
+	if ok {
+		delete(m.pendingDrain, name)
+	}
+	m.mu.Unlock()
+
+	if !ok || len(workers) == 0 {
+		return nil
+	}
+
+	for _, proc := range workers {
+		m.stopProcess(proc)
+	}
+	return nil
 }
 
 // ReloadAll stops all processes and restarts them from saved configs.
@@ -633,12 +664,23 @@ func (m *Manager) stopProcess(proc *managed) {
 	proc.status = StatusStopping
 
 	if proc.cmd == nil || proc.cmd.Process == nil {
-		// Adopted process without cmd reference
+		// Adopted process without cmd reference.
+		// Try both process group and direct PID since adopted processes
+		// may have a different PGID than their PID.
 		if proc.pid > 0 {
 			syscall.Kill(-proc.pid, stopSig)
-			time.Sleep(2 * time.Second)
+			syscall.Kill(proc.pid, stopSig)
+			// Poll for exit instead of sleeping a fixed duration
+			for i := 0; i < 10; i++ {
+				if !processAlive(proc.pid) {
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
 			if processAlive(proc.pid) {
 				syscall.Kill(-proc.pid, syscall.SIGKILL)
+				syscall.Kill(proc.pid, syscall.SIGKILL)
+				time.Sleep(200 * time.Millisecond)
 			}
 		}
 	} else {
@@ -669,7 +711,7 @@ func (m *Manager) stopProcess(proc *managed) {
 
 	// Last resort: if port is still held by an orphan, kill it
 	if proc.port > 0 {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		killPortHolder(proc.port)
 	}
 }
