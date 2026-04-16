@@ -43,6 +43,8 @@ func NewEngine(baseDir string) *Engine {
 }
 
 // GetLogs retrieves log entries for an app with optional filtering.
+// Continuation lines (marked with tab by timestampWriter) are merged into
+// the preceding entry's message.
 func (e *Engine) GetLogs(appName string, filter Filter) ([]Entry, error) {
 	logPath := filepath.Join(e.baseDir, "apps", appName, "current.log")
 
@@ -59,6 +61,13 @@ func (e *Engine) GetLogs(appName string, filter Filter) ([]Entry, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
+			continue
+		}
+
+		// Merge continuation lines with the previous entry
+		if IsTabContinuation(line) && len(entries) > 0 {
+			content := ExtractContinuationContent(line)
+			entries[len(entries)-1].Message += "\n" + content
 			continue
 		}
 
@@ -84,6 +93,42 @@ func (e *Engine) GetLogs(appName string, filter Filter) ([]Entry, error) {
 	}
 
 	return entries, scanner.Err()
+}
+
+// IsTabContinuation checks if a raw log line is a continuation line
+// marked with a tab character after the timestamp by timestampWriter.
+// Format: "2006-01-02T15:04:05Z \tcontent" (tab at position 21 or 26 for offset timestamps).
+func IsTabContinuation(line string) bool {
+	if len(line) < 23 {
+		return false
+	}
+	// Quick check: must look like a timestamp
+	if line[4] != '-' || line[10] != 'T' {
+		return false
+	}
+	// UTC timestamp (20 chars): "2006-01-02T15:04:05Z \t..."
+	if len(line) > 22 && line[20] == ' ' && line[21] == '\t' {
+		return true
+	}
+	// RFC3339 with offset (25 chars): "2006-01-02T15:04:05+00:00 \t..."
+	if len(line) > 27 && line[25] == ' ' && line[26] == '\t' {
+		return true
+	}
+	return false
+}
+
+// ExtractContinuationContent extracts the content from a tab-marked continuation line,
+// stripping the timestamp prefix and tab marker.
+func ExtractContinuationContent(line string) string {
+	// UTC format: skip 22 chars ("2006-01-02T15:04:05Z \t")
+	if len(line) > 22 && line[20] == ' ' && line[21] == '\t' {
+		return line[22:]
+	}
+	// RFC3339 offset format: skip 27 chars
+	if len(line) > 27 && line[25] == ' ' && line[26] == '\t' {
+		return line[27:]
+	}
+	return line
 }
 
 // GetErrorLogs retrieves only error-level logs.

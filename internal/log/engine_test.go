@@ -197,6 +197,91 @@ func TestGetLogsWithSinceFilter(t *testing.T) {
 	}
 }
 
+func TestIsTabContinuation(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		// UTC timestamp with tab marker
+		{"2026-04-16T10:00:00Z \t  \"sent\": \"TRY\",", true},
+		{"2026-04-16T10:00:00Z \t}", true},
+		// Normal line (no tab)
+		{"2026-04-16T10:00:00Z [INFO] Server started", false},
+		// RFC3339 with offset and tab marker
+		{"2026-04-16T10:00:00+03:00 \t  \"key\": \"val\"", true},
+		// Too short
+		{"short", false},
+		// No timestamp pattern
+		{"not-a-timestamp-at-all here", false},
+	}
+
+	for _, tt := range tests {
+		got := IsTabContinuation(tt.line)
+		if got != tt.want {
+			t.Errorf("IsTabContinuation(%q) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
+}
+
+func TestExtractContinuationContent(t *testing.T) {
+	tests := []struct {
+		line string
+		want string
+	}{
+		{"2026-04-16T10:00:00Z \t  \"sent\": \"TRY\",", "  \"sent\": \"TRY\","},
+		{"2026-04-16T10:00:00Z \t}", "}"},
+		{"2026-04-16T10:00:00+03:00 \t  nested", "  nested"},
+	}
+
+	for _, tt := range tests {
+		got := ExtractContinuationContent(tt.line)
+		if got != tt.want {
+			t.Errorf("ExtractContinuationContent(%q) = %q, want %q", tt.line, got, tt.want)
+		}
+	}
+}
+
+func TestGetLogsMultiLineMerge(t *testing.T) {
+	dir := t.TempDir()
+	engine := NewEngine(dir)
+
+	appDir := dir + "/apps/test-app"
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Simulate timestampWriter output with continuation lines
+	logContent := "2026-04-16T10:00:00Z [CURRENCY] Backend response: {\n" +
+		"2026-04-16T10:00:00Z \t  \"sent\": \"TRY\",\n" +
+		"2026-04-16T10:00:00Z \t  \"price\": 4999\n" +
+		"2026-04-16T10:00:00Z \t}\n" +
+		"2026-04-16T10:00:01Z Next log entry\n"
+
+	if err := os.WriteFile(appDir+"/current.log", []byte(logContent), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	entries, err := engine.GetLogs("test-app", Filter{Lines: 100})
+	if err != nil {
+		t.Fatalf("get logs: %v", err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries (multi-line merged), got %d", len(entries))
+	}
+
+	// First entry should have merged message
+	expected := "[CURRENCY] Backend response: {\n  \"sent\": \"TRY\",\n  \"price\": 4999\n}"
+	if entries[0].Message != expected {
+		t.Errorf("merged message:\ngot:  %q\nwant: %q", entries[0].Message, expected)
+	}
+
+	// Second entry should be separate
+	if entries[1].Message != "Next log entry" {
+		t.Errorf("second entry: got %q, want %q", entries[1].Message, "Next log entry")
+	}
+}
+
 func createTestLogFile(dir string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err

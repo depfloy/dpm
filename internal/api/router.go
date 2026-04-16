@@ -442,15 +442,21 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if format == "json" {
-		// Parse lines into structured entries, merging stack trace continuations
+		// Parse lines into structured entries, merging continuation lines
 		engine := dpmlog.NewEngine(r.config.Logging.Dir)
 		var entries []dpmlog.Entry
 		for _, line := range allLines {
+			// Check for tab-marked continuation lines from timestampWriter
+			if dpmlog.IsTabContinuation(line) && len(entries) > 0 {
+				content := dpmlog.ExtractContinuationContent(line)
+				entries[len(entries)-1].Message += "\n" + content
+				continue
+			}
+
 			entry := engine.ParseLine(line, name)
 			msg := strings.TrimSpace(entry.Message)
 
-			// Merge into previous entry if this is a continuation line
-			// (stack trace "at ...", braces, error properties)
+			// Fallback: merge by heuristic for older log files without tab markers
 			if len(entries) > 0 && isContinuation(msg) {
 				prev := &entries[len(entries)-1]
 				prev.Message += "\n" + msg
@@ -460,8 +466,18 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 		}
 		r.successResponse(w, entries)
 	} else {
-		w.Header().Set("Content-Type", "text/plain")
+		// Plain text: merge continuation lines for readable output
+		var merged []string
 		for _, line := range allLines {
+			if dpmlog.IsTabContinuation(line) && len(merged) > 0 {
+				content := dpmlog.ExtractContinuationContent(line)
+				merged[len(merged)-1] += "\n" + content
+			} else {
+				merged = append(merged, line)
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		for _, line := range merged {
 			fmt.Fprintln(w, line)
 		}
 
@@ -511,11 +527,24 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 						}
 						file.Seek(pos, 0)
 						scanner := bufio.NewScanner(file)
+						var pendingLine string
 						for scanner.Scan() {
 							line := scanner.Text()
-							if line != "" {
-								fmt.Fprintln(w, line)
+							if line == "" {
+								continue
 							}
+							if dpmlog.IsTabContinuation(line) && pendingLine != "" {
+								content := dpmlog.ExtractContinuationContent(line)
+								pendingLine += "\n" + content
+							} else {
+								if pendingLine != "" {
+									fmt.Fprintln(w, pendingLine)
+								}
+								pendingLine = line
+							}
+						}
+						if pendingLine != "" {
+							fmt.Fprintln(w, pendingLine)
 						}
 						positions[p] = info.Size()
 						file.Close()

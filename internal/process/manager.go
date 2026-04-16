@@ -1033,16 +1033,29 @@ func resolveTimeout(s string, fallback time.Duration) time.Duration {
 }
 
 // timestampWriter wraps an io.Writer and prepends ISO8601 timestamp to each line.
-// Continuation lines (stack traces starting with "at ", whitespace, or common
-// error continuation patterns) are written without a new timestamp so the log
-// parser can group them with the preceding entry.
+// It uses brace/bracket depth tracking to group multi-line output (e.g. pretty-printed
+// JSON from Node.js console.log) into a single log entry. Continuation lines are
+// written with a tab marker so the log parser can merge them on read.
 type timestampWriter struct {
-	w      io.Writer
-	buf    []byte
-	lastTS string
+	w         io.Writer
+	buf       []byte
+	lastTS    string
+	depth     int       // brace/bracket nesting depth for multi-line grouping
+	contCount int       // consecutive continuation lines (safety limit)
+	lastWrite time.Time // last write time for depth timeout
 }
 
+// maxContinuationLines prevents runaway grouping from unmatched braces.
+const maxContinuationLines = 200
+
 func (tw *timestampWriter) Write(p []byte) (int, error) {
+	// Reset depth if too much time passed — the multi-line block likely ended
+	if tw.depth > 0 && !tw.lastWrite.IsZero() && time.Since(tw.lastWrite) > 2*time.Second {
+		tw.depth = 0
+		tw.contCount = 0
+	}
+	tw.lastWrite = time.Now()
+
 	tw.buf = append(tw.buf, p...)
 
 	for {
@@ -1064,8 +1077,28 @@ func (tw *timestampWriter) Write(p []byte) (int, error) {
 			continue
 		}
 
-		if isContinuationLine(line) {
-			// Continuation: use same timestamp, indent with tab
+		isCont := tw.depth > 0 || isContinuationLine(line)
+
+		// Safety: prevent runaway continuation from unmatched braces
+		if isCont {
+			tw.contCount++
+			if tw.contCount > maxContinuationLines {
+				tw.depth = 0
+				tw.contCount = 0
+				isCont = false
+			}
+		} else {
+			tw.contCount = 0
+		}
+
+		// Update brace/bracket depth AFTER deciding continuation status
+		tw.depth += countDepthChange(line)
+		if tw.depth < 0 {
+			tw.depth = 0
+		}
+
+		if isCont {
+			// Continuation: use same timestamp, tab marker for parser
 			_, err := fmt.Fprintf(tw.w, "%s \t%s\n", tw.lastTS, line)
 			if err != nil {
 				return len(p), err
@@ -1080,6 +1113,38 @@ func (tw *timestampWriter) Write(p []byte) (int, error) {
 	}
 
 	return len(p), nil
+}
+
+// countDepthChange counts brace/bracket nesting changes in a line,
+// properly skipping characters inside quoted strings.
+func countDepthChange(line string) int {
+	delta := 0
+	inString := false
+	escaped := false
+	for _, ch := range line {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch ch {
+		case '{', '[':
+			delta++
+		case '}', ']':
+			delta--
+		}
+	}
+	return delta
 }
 
 // DoctorReport contains the results of a health check.
@@ -1258,21 +1323,27 @@ func findPIDByInode(inode string) int {
 }
 
 // isContinuationLine detects stack trace and multi-line error continuation lines.
+// Note: multi-line JSON/object grouping is primarily handled by depth tracking
+// in timestampWriter. This function catches patterns that appear at depth=0.
 func isContinuationLine(line string) bool {
 	if len(line) == 0 {
 		return false
 	}
-	// Lines starting with whitespace, "at ", "}", "  code:", "  errno:", "  syscall:"
+	// Lines starting with whitespace (indented JSON, stack traces, etc.)
 	if line[0] == ' ' || line[0] == '\t' {
 		return true
 	}
 	trimmed := strings.TrimSpace(line)
+	// Stack trace lines
 	if strings.HasPrefix(trimmed, "at ") {
 		return true
 	}
-	if trimmed == "}" || trimmed == "{" || trimmed == "})" {
+	// Closing braces/brackets (end of multi-line blocks)
+	if trimmed == "}" || trimmed == "})" || trimmed == "});" ||
+		trimmed == "]" || trimmed == "]," || trimmed == "}," {
 		return true
 	}
+	// Node.js error object properties
 	if strings.HasPrefix(trimmed, "code:") || strings.HasPrefix(trimmed, "errno:") ||
 		strings.HasPrefix(trimmed, "syscall:") || strings.HasPrefix(trimmed, "address:") ||
 		strings.HasPrefix(trimmed, "port:") {

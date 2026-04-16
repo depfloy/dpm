@@ -2,6 +2,7 @@ package process
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -816,16 +817,21 @@ func TestIsContinuationLine(t *testing.T) {
 		{"at Object.<anonymous> (/app/index.js:10:5)", true},
 		{"  at Module._compile (node:internal/modules/cjs/loader:1376:14)", true},
 		{"}", true},
-		{"{", true},
 		{"})", true},
+		{"});", true},
+		{"},", true},
+		{"]", true},
+		{"],", true},
 		{"  code: 'ENOENT'", true},
 		{"  errno: -2", true},
 		{"  syscall: 'open'", true},
 		{"  address: '127.0.0.1'", true},
 		{"  port: 3000", true},
 		{"\tindented with tab", true},
+		{"  \"sent\": \"TRY\",", true}, // indented JSON key-value
 		{"Error: ENOENT", false},
 		{"normal log line", false},
+		{"{", false}, // opening brace handled by depth tracking, not heuristic
 		{"", false},
 	}
 
@@ -834,6 +840,81 @@ func TestIsContinuationLine(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("isContinuationLine(%q) = %v, want %v", tt.line, got, tt.want)
 		}
+	}
+}
+
+func TestCountDepthChange(t *testing.T) {
+	tests := []struct {
+		line string
+		want int
+	}{
+		{`[CURRENCY] Backend response: {`, 1}, // [ and ] cancel out, { adds 1
+		{`{`, 1},
+		{`}`, -1},
+		{`{ "key": "value" }`, 0},
+		{`"nested": {`, 1},
+		{`  "key": "value with { braces }"`, 0}, // braces inside quotes
+		{`[`, 1},
+		{`]`, -1},
+		{`[1, 2, 3]`, 0},
+		{`normal text`, 0},
+	}
+
+	for _, tt := range tests {
+		got := countDepthChange(tt.line)
+		if got != tt.want {
+			t.Errorf("countDepthChange(%q) = %d, want %d", tt.line, got, tt.want)
+		}
+	}
+}
+
+func TestTimestampWriterMultiLineJSON(t *testing.T) {
+	var buf []byte
+	tw := &timestampWriter{
+		w: &bufWriter{buf: &buf},
+	}
+
+	// Simulate Node.js console.log(JSON.stringify(data, null, 2))
+	input := `[CURRENCY] Backend response: {
+  "sent": "TRY",
+  "stockCurrency": "TRY",
+  "price": 4999
+}
+next log entry
+`
+	_, err := tw.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	output := string(buf)
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+
+	// First line should have timestamp without tab
+	if strings.Contains(lines[0], "\t") {
+		t.Errorf("first line should not be continuation: %q", lines[0])
+	}
+
+	// Lines 2-4 (indented JSON) should be continuations (tab marker)
+	for i := 1; i <= 4; i++ {
+		if i >= len(lines) {
+			t.Fatalf("expected at least %d lines, got %d", i+1, len(lines))
+		}
+		// Continuation lines have " \t" after timestamp
+		if !strings.Contains(lines[i], " \t") {
+			t.Errorf("line %d should be continuation (tab marker): %q", i, lines[i])
+		}
+	}
+
+	// "next log entry" should be a new entry (no tab)
+	lastLine := lines[len(lines)-1]
+	// After timestamp (20 chars), should have space then content (no tab)
+	afterTS := lastLine[21:]
+	if afterTS[0] == '\t' {
+		t.Errorf("last line should not be continuation: %q", lastLine)
+	}
+	if !strings.Contains(lastLine, "next log entry") {
+		t.Errorf("last line should contain 'next log entry': %q", lastLine)
 	}
 }
 
