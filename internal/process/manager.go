@@ -379,6 +379,7 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 	}
 
 	// Move new workers from deploy keys to final keys
+	finalKeys := make(map[string]bool)
 	for i := 0; i < workerCount; i++ {
 		deployKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, i)
 		finalKey := instanceKey(cfg.Name, i, workerCount)
@@ -387,6 +388,7 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 			m.store.DeleteProcess(deployKey)
 			m.processes[finalKey] = proc
 			m.persistProcess(proc, finalKey)
+			finalKeys[finalKey] = true
 		}
 	}
 	m.mu.Unlock()
@@ -397,7 +399,13 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 		m.mu.Lock()
 		for _, ow := range oldWorkers {
 			m.pendingDrain[cfg.Name] = append(m.pendingDrain[cfg.Name], ow.proc)
-			m.store.DeleteProcess(ow.key)
+			// Do NOT delete a store key that step 4 just re-persisted for a promoted
+			// worker. An old worker and its replacement share the same final key
+			// (same name + worker count), so deleting it here would wipe the live
+			// process from the store and orphan it on the next daemon restart.
+			if !finalKeys[ow.key] {
+				m.store.DeleteProcess(ow.key)
+			}
 		}
 		m.mu.Unlock()
 	}
@@ -725,37 +733,30 @@ func (m *Manager) stopProcess(proc *managed) {
 			}
 		}
 	} else {
-		// Send configured signal to process group
+		// Send the configured stop signal to the whole process group. We deliberately
+		// do NOT call cmd.Wait() here: the monitor goroutine spawned in startInstance
+		// already owns the single cmd.Wait() for this Cmd, and a second concurrent
+		// Wait() on the same *exec.Cmd is a data race. We poll for the process to
+		// disappear instead; the monitor reaps it when it exits (cmd.WaitDelay bounds
+		// that even if a grandchild keeps the output pipe open).
 		pgid, err := syscall.Getpgid(proc.pid)
 		if err == nil {
 			syscall.Kill(-pgid, stopSig)
+		} else {
+			syscall.Kill(proc.pid, stopSig)
 		}
 
-		// Wait for graceful shutdown up to configured timeout. cmd.Wait runs in a
-		// goroutine; cmd.WaitDelay (set in startInstance) guarantees it eventually
-		// returns even if a grandchild keeps the output pipe open.
-		done := make(chan struct{})
-		go func() {
-			proc.cmd.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			// Process exited gracefully
-		case <-time.After(stopTimeout):
-			// Force kill the whole process group, then wait for the Wait goroutine
-			// to unwind. WaitDelay bounds it; the extra cap is a hard safety net so
-			// stopProcess can never block forever. Do NOT call cmd.Wait again here -
-			// the goroutine above already owns the single Wait call.
+		// Wait for graceful shutdown up to stopTimeout.
+		if !waitForExit(proc.pid, stopTimeout) {
+			// Force kill the whole process group, then give the monitor a bounded
+			// window (WaitDelay + margin) to reap so stopProcess never blocks forever.
 			if pgid > 0 {
 				syscall.Kill(-pgid, syscall.SIGKILL)
+			} else {
+				syscall.Kill(proc.pid, syscall.SIGKILL)
 			}
 			waitDelay := resolveTimeout(proc.config.WaitDelay, 10*time.Second)
-			select {
-			case <-done:
-			case <-time.After(waitDelay + 2*time.Second):
-			}
+			waitForExit(proc.pid, waitDelay+2*time.Second)
 		}
 	}
 
@@ -1036,6 +1037,22 @@ func processAlive(pid int) bool {
 	// Signal 0 checks existence without sending a signal
 	err = proc.Signal(syscall.Signal(0))
 	return err == nil
+}
+
+// waitForExit polls until the process is gone or the timeout elapses, returning
+// true if it exited. Used by stopProcess so it never calls cmd.Wait() itself -
+// the monitor goroutine owns the single Wait() for a cmd-backed process.
+func waitForExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !processAlive(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // getProcessMemory returns the RSS memory usage in bytes for a PID.

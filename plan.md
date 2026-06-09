@@ -42,3 +42,14 @@ Seçilen yaklaşım: pipe ve feature'lar (timestamp/gruplama/rotation) korunur; 
 - **DoD #3 (pipe → dosya):** ERTELENDİ — kullanıcı kararı; feature regresyonu gerektiriyor (`timestampWriter` + `RotatingWriter` çıplak `*os.File` gerektirir).
 - **DoD #7 (test sunucu + fleet rollout):** kod kapsamı dışı (deployment).
 - Not: `router.go` değişmedi — wedge'in kaynağı `Stop()`'un kilit davranışıydı, Manager tarafında çözüldü.
+
+---
+
+# v1.8.1 — Blue-green deploy state-clobber (orphan-after-restart) + stopProcess double-Wait
+
+Production gözlem (ursa-jupiter test env): update sonrası `dpm list` boş ama süreçler arka planda canlı. Log kanıtı: state DB, 1.7.0→1.7.1 arasında (2026-04-27'deki 6 blue-green deploy'dan sonra) boşaldı; 1.7.1 ve 1.8.0 açılışta "no orphan processes to adopt". **v1.8.0 sebep değil** — DB zaten bir aydır boştu.
+
+- [x] **Blue-green deploy store-clobber (asıl kök neden)** — `Deploy` adım 4 yeni worker'ı `finalKey`'e persist ediyor, ama adım 5 eski worker'ı park ederken **aynı finalKey'i** store'dan siliyordu (eski+yeni aynı isimde aynı anahtarı paylaşır). Sonuç: canlı süreç store'dan düşüyor → bir sonraki restart'ta orphan. Fix: adım 4'te persist edilen `finalKeys` set'i; adım 5'te bu set'teki anahtar silinmiyor (`manager.go` `Deploy`).
+- [x] **stopProcess double-Wait veri yarışı (bonus, pre-existing)** — `stopProcess` cmd-backed dalı `go cmd.Wait()` açıyordu; ama `monitor` goroutine'i zaten aynı `*exec.Cmd` üzerinde `cmd.Wait()` çağırıyor → eşzamanlı çift Wait = data race. Fix: `stopProcess` artık Wait çağırmıyor, `waitForExit` ile `processAlive` polling yapıyor; tek Wait sahibi `monitor` (WaitDelay ile reap eder). Bu, process paketindeki eski "-race flake"in başlıca kaynağıydı.
+- [x] **Regresyon testi** — `TestDeployPersistsPromotedWorkerInStore`: deploy sonrası `store.GetProcess(finalKey)` yeni port ile kalmalı. Fix olmadan "process not found" → FAIL, fix ile PASS. İzole `-race` temiz.
+- **Bilinen, ayrı (bloklamıyor):** `TestReloadAllWithAdoptedProcesses` `-race` ile ara sıra patlıyor — test, canlı bir process'in `proc.cmd`'ını `nil` yapıp monitor ile yarışıyor (test-only; production'da `proc.cmd` değişmez). Ayrı test temizliği.

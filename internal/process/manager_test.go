@@ -484,6 +484,57 @@ func TestDeployBlueGreen(t *testing.T) {
 	mgr.Stop("deploy-app")
 }
 
+// TestDeployPersistsPromotedWorkerInStore guards against the blue-green deploy
+// store-clobber bug: step 4 promotes the new worker to the final key and persists
+// it, but step 5 parks the old worker (which shares that SAME final key for a
+// same-name deploy) and must NOT delete that key from the store afterwards -
+// otherwise the live, promoted process is wiped from state and silently orphaned
+// on the next daemon restart (dpm list shows nothing while the process keeps
+// running). Without the fix store.GetProcess returns "not found" here.
+func TestDeployPersistsPromotedWorkerInStore(t *testing.T) {
+	mgr, store := testManager(t)
+
+	cfg := testConfig("deploy-store-app", "sleep 300")
+	cfg.Cluster = &config.ClusterConfig{Mode: "fixed", Workers: 1, DrainTimeout: "1s"}
+	cfg.Instances = 1
+
+	if err := mgr.Start(cfg, []int{9300}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	done := make(chan struct{})
+	var deployErr error
+	go func() {
+		_, deployErr = mgr.Deploy(cfg, []int{9400})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(40 * time.Second):
+		t.Fatal("deploy timed out - possible deadlock")
+	}
+	if deployErr != nil {
+		t.Fatalf("deploy: %v", deployErr)
+	}
+
+	// The promoted worker must still be in the store under its final key, with the
+	// NEW port, so a restarted daemon can re-adopt it instead of orphaning it.
+	ps, err := store.GetProcess("deploy-store-app")
+	if err != nil {
+		t.Fatalf("promoted worker missing from store after deploy (would be orphaned on next restart): %v", err)
+	}
+	if ps.Port != 9400 {
+		t.Errorf("store port = %d, want 9400 (new port)", ps.Port)
+	}
+	if ps.Status == StatusStopped || ps.Status == StatusErrored {
+		t.Errorf("store status = %s, want a live status", ps.Status)
+	}
+
+	mgr.Drain("deploy-store-app")
+	mgr.Stop("deploy-store-app")
+}
+
 func TestDrainNoOp(t *testing.T) {
 	mgr, _ := testManager(t)
 
