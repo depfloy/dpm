@@ -157,10 +157,13 @@ func (d *Daemon) adoptOrphans() error {
 	restarted := 0
 	cleaned := 0
 
-	// Collect dead processes for restart (deduplicated by base name)
+	// Collect dead processes for restart (deduplicated by base name).
+	// A multi-worker process has several instance keys ("app:0", "app:1", ...)
+	// each with its own port; we must collect ALL of them so the restart recreates
+	// the correct worker count (process.Manager.Start derives it from len(ports)).
 	type restartInfo struct {
-		cfg  *config.ProcessConfig
-		port int
+		cfg   *config.ProcessConfig
+		ports []int
 	}
 	toRestart := make(map[string]*restartInfo) // key: base process name
 
@@ -221,11 +224,19 @@ func (d *Daemon) adoptOrphans() error {
 				baseName = ps.Name[:idx]
 			}
 
-			// Only collect once per base name
-			if _, exists := toRestart[baseName]; !exists {
+			// Collect config once per base name, but accumulate every instance's port.
+			if existing, exists := toRestart[baseName]; exists {
+				if ps.Port > 0 {
+					existing.ports = append(existing.ports, ps.Port)
+				}
+			} else {
 				var cfg config.ProcessConfig
 				if err := json.Unmarshal(ps.ConfigJSON, &cfg); err == nil && cfg.Name != "" {
-					toRestart[baseName] = &restartInfo{cfg: &cfg, port: ps.Port}
+					var ports []int
+					if ps.Port > 0 {
+						ports = append(ports, ps.Port)
+					}
+					toRestart[baseName] = &restartInfo{cfg: &cfg, ports: ports}
 					d.logger.Info("will restart dead process",
 						"name", baseName,
 						"port", ps.Port,
@@ -239,7 +250,7 @@ func (d *Daemon) adoptOrphans() error {
 
 	// Restart dead processes from saved configs
 	for name, r := range toRestart {
-		if err := d.processManager.Start(r.cfg, []int{r.port}); err != nil {
+		if err := d.processManager.Start(r.cfg, r.ports); err != nil {
 			d.logger.Error("failed to restart dead process",
 				"name", name,
 				"error", err,
@@ -249,7 +260,7 @@ func (d *Daemon) adoptOrphans() error {
 			restarted++
 			d.logger.Info("restarted dead process",
 				"name", name,
-				"port", r.port,
+				"ports", r.ports,
 			)
 		}
 	}

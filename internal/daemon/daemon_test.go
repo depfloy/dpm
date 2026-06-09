@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"testing"
@@ -37,6 +39,72 @@ func testDaemonComponents(t *testing.T) (*state.Store, *process.Manager, *port.M
 	portMgr := port.NewManager(store)
 
 	return store, pm, portMgr
+}
+
+// TestAdoptOrphansRestartsAllWorkerPorts verifies that when a multi-worker
+// process is found dead on startup, adoptOrphans restarts ALL of its workers
+// (one per saved instance port), not collapsing it down to a single worker.
+// This exercises the real d.adoptOrphans() against the per-base-name port
+// accumulation fix.
+func TestAdoptOrphansRestartsAllWorkerPorts(t *testing.T) {
+	store, pm, portMgr := testDaemonComponents(t)
+
+	d := &Daemon{
+		store:          store,
+		processManager: pm,
+		portManager:    portMgr,
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	cfgJSON, _ := json.Marshal(&config.ProcessConfig{
+		Name:          "multi-app",
+		Command:       "sleep 300",
+		CWD:           "/tmp",
+		Type:          "nodejs",
+		Instances:     2,
+		RestartPolicy: "always",
+	})
+
+	// Two dead instances of the same base process, each with its own port.
+	const deadPID = 999999999
+	for i, portNum := range []int{12001, 12002} {
+		key := "multi-app:" + string(rune('0'+i))
+		store.SaveProcess(&state.ProcessState{
+			Name:       key,
+			PID:        deadPID,
+			Port:       portNum,
+			Status:     "online",
+			Command:    "sleep 300",
+			CWD:        "/tmp",
+			Type:       "nodejs",
+			ConfigJSON: cfgJSON,
+		})
+	}
+
+	if err := d.adoptOrphans(); err != nil {
+		t.Fatalf("adoptOrphans: %v", err)
+	}
+
+	// Give the restarted workers a moment to register.
+	time.Sleep(1 * time.Second)
+
+	ports := map[int]bool{}
+	count := 0
+	for _, info := range pm.List() {
+		if info.Type == "nodejs" && info.Command == "sleep 300" {
+			count++
+			ports[info.Port] = true
+		}
+	}
+	if count != 2 {
+		t.Errorf("restarted worker count = %d, want 2 (multi-worker app must not collapse to one)", count)
+	}
+	if !ports[12001] || !ports[12002] {
+		t.Errorf("restarted ports = %v, want both 12001 and 12002", ports)
+	}
+
+	// Clean up the spawned processes.
+	pm.Stop("multi-app")
 }
 
 // ==================== adoptOrphans Releases Ports for Dead Processes ====================

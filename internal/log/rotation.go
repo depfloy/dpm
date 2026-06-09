@@ -99,12 +99,20 @@ func (rw *RotatingWriter) rotate() error {
 	// Delete oldest if over maxBackups
 	os.Remove(rw.backupName(rw.maxBackups + 1))
 
-	// Current → .1
-	os.Rename(rw.path, rw.backupName(1))
-
-	// Compress .1 in background if enabled
+	// Current → .1. Compression is done synchronously and only removes the
+	// source once the backup is durably written, so a crash or disk-full during
+	// compression can never lose log data. Doing it inline (rather than in a
+	// background goroutine) also avoids racing the next rotate()'s backup shift.
 	if rw.compress {
-		go rw.compressFile(rw.backupName(1))
+		if err := compressTo(rw.path, rw.backupName(1)); err != nil {
+			// Compression failed - fall back to an uncompressed rename so the data
+			// is preserved rather than discarded.
+			os.Rename(rw.path, fmt.Sprintf("%s.1", rw.path))
+		} else {
+			os.Remove(rw.path)
+		}
+	} else {
+		os.Rename(rw.path, rw.backupName(1))
 	}
 
 	// Open new file
@@ -113,30 +121,44 @@ func (rw *RotatingWriter) rotate() error {
 }
 
 func (rw *RotatingWriter) backupName(n int) string {
-	if rw.compress && n > 1 {
+	if rw.compress {
 		return fmt.Sprintf("%s.%d.gz", rw.path, n)
 	}
 	return fmt.Sprintf("%s.%d", rw.path, n)
 }
 
-func (rw *RotatingWriter) compressFile(path string) {
-	src, err := os.Open(path)
+// compressTo gzips srcPath into dstPath. It returns an error (and removes any
+// partial output) if any step fails, so the caller can decide whether it is safe
+// to delete the source. It never deletes the source itself.
+func compressTo(srcPath, dstPath string) error {
+	src, err := os.Open(srcPath)
 	if err != nil {
-		return
+		return err
 	}
 	defer src.Close()
 
-	dst, err := os.Create(path + ".gz")
+	dst, err := os.Create(dstPath)
 	if err != nil {
-		return
+		return err
 	}
-	defer dst.Close()
 
 	gz := gzip.NewWriter(dst)
-	io.Copy(gz, src)
-	gz.Close()
-
-	os.Remove(path)
+	if _, err := io.Copy(gz, src); err != nil {
+		gz.Close()
+		dst.Close()
+		os.Remove(dstPath)
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		dst.Close()
+		os.Remove(dstPath)
+		return err
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(dstPath)
+		return err
+	}
+	return nil
 }
 
 // ParseMaxSize converts a size string like "100MB", "1GB" to bytes.

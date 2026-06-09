@@ -150,6 +150,9 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 		} else {
 			previousRestarts = existing.restarts
 		}
+		// existing is normally already dead here (monitor restart path), so the
+		// kill/wait returns immediately; signalStop closes its stopCh first.
+		m.signalStop(existing)
 		m.stopProcess(existing)
 	}
 
@@ -174,6 +177,13 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
+
+	// Cap how long cmd.Wait blocks on the stdout/stderr copy goroutines after the
+	// process exits. A grandchild (e.g. node/python under `sh -c`) can inherit the
+	// output pipe and keep it open forever, which would otherwise hang Wait and -
+	// when that Wait runs under the Manager mutex - deadlock the whole daemon.
+	// After WaitDelay, Wait force-closes the pipe FDs so Wait always returns.
+	cmd.WaitDelay = resolveTimeout(cfg.WaitDelay, 10*time.Second)
 
 	// Set up log files with timestamp prefix writer
 	logFile, errFile, err := m.openLogFiles(cfg.Name, instance)
@@ -215,21 +225,28 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 
 // Stop terminates a process and all its instances.
 func (m *Manager) Stop(name string) error {
+	// Phase 1 (under lock): signal stop intent so monitors won't restart, mark
+	// stopped, persist, and collect the procs to kill. We do NOT block here.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	stopped := 0
+	var toStop []*managed
 	for key, proc := range m.processes {
 		if proc.config.Name == name {
-			m.stopProcess(proc)
+			m.signalStop(proc)
 			proc.status = StatusStopped
 			m.persistProcess(proc, key)
-			stopped++
+			toStop = append(toStop, proc)
 		}
 	}
+	m.mu.Unlock()
 
-	if stopped == 0 {
+	if len(toStop) == 0 {
 		return fmt.Errorf("process not found: %s", name)
+	}
+
+	// Phase 2 (no lock): perform the blocking kill/wait outside the lock so other
+	// manager operations are not stalled for up to stop_timeout.
+	for _, proc := range toStop {
+		m.stopProcess(proc)
 	}
 	return nil
 }
@@ -275,11 +292,14 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 				cleanKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, j)
 				m.mu.Lock()
 				if p, ok := m.processes[cleanKey]; ok {
-					m.stopProcess(p)
+					m.signalStop(p)
 					delete(m.processes, cleanKey)
 					m.store.DeleteProcess(cleanKey)
+					m.mu.Unlock()
+					m.stopProcess(p)
+				} else {
+					m.mu.Unlock()
 				}
-				m.mu.Unlock()
 			}
 			return nil, fmt.Errorf("start new worker %d: %w", i, err)
 		}
@@ -331,11 +351,14 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 			deployKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, i)
 			m.mu.Lock()
 			if p, ok := m.processes[deployKey]; ok {
-				m.stopProcess(p)
+				m.signalStop(p)
 				delete(m.processes, deployKey)
 				m.store.DeleteProcess(deployKey)
+				m.mu.Unlock()
+				m.stopProcess(p)
+			} else {
+				m.mu.Unlock()
 			}
-			m.mu.Unlock()
 		}
 		return nil, fmt.Errorf("new workers failed to come online within 30s")
 	}
@@ -395,12 +418,18 @@ func (m *Manager) Drain(name string) error {
 	if ok {
 		delete(m.pendingDrain, name)
 	}
+	// Signal stop intent under the lock so the mutation of proc.status/stopCh does
+	// not race with the parked workers' still-running monitor goroutines.
+	for _, proc := range workers {
+		m.signalStop(proc)
+	}
 	m.mu.Unlock()
 
 	if !ok || len(workers) == 0 {
 		return nil
 	}
 
+	// Blocking kill/wait happens outside the lock.
 	for _, proc := range workers {
 		m.stopProcess(proc)
 	}
@@ -649,12 +678,11 @@ func (m *Manager) Attach(ps *state.ProcessState) error {
 	return nil
 }
 
-// stopProcess sends the configured stop signal and waits, then SIGKILL if needed.
-// After stopping, verifies the port is actually freed to prevent orphan issues.
-func (m *Manager) stopProcess(proc *managed) {
-	stopSig := resolveSignal(proc.config.StopSignal)
-	stopTimeout := resolveTimeout(proc.config.StopTimeout, 10*time.Second)
-
+// signalStop marks a process as stopping and closes its stop channel so its
+// monitor goroutine will not restart it. The caller MUST hold m.mu — it mutates
+// shared proc state (status) and the stopCh. This is the "signal" half; the
+// blocking kill/wait is done by stopProcess WITHOUT the lock held.
+func (m *Manager) signalStop(proc *managed) {
 	// Safe close - channel may already be closed from a previous stop
 	select {
 	case <-proc.stopCh:
@@ -662,6 +690,19 @@ func (m *Manager) stopProcess(proc *managed) {
 		close(proc.stopCh)
 	}
 	proc.status = StatusStopping
+}
+
+// stopProcess sends the configured stop signal and waits, then SIGKILL if needed.
+// After stopping, verifies the port is actually freed to prevent orphan issues.
+//
+// This is the blocking "wait" half and should be called WITHOUT m.mu held — it can
+// block for up to stop_timeout, so holding the lock here would stall every other
+// manager operation. It only reads immutable proc fields (cmd, pid, port), so it is
+// safe to run lock-free. Callers must invoke signalStop (under the lock) first so the
+// monitor goroutine sees the stop intent before the process dies.
+func (m *Manager) stopProcess(proc *managed) {
+	stopSig := resolveSignal(proc.config.StopSignal)
+	stopTimeout := resolveTimeout(proc.config.StopTimeout, 10*time.Second)
 
 	if proc.cmd == nil || proc.cmd.Process == nil {
 		// Adopted process without cmd reference.
@@ -690,7 +731,9 @@ func (m *Manager) stopProcess(proc *managed) {
 			syscall.Kill(-pgid, stopSig)
 		}
 
-		// Wait for graceful shutdown up to configured timeout
+		// Wait for graceful shutdown up to configured timeout. cmd.Wait runs in a
+		// goroutine; cmd.WaitDelay (set in startInstance) guarantees it eventually
+		// returns even if a grandchild keeps the output pipe open.
 		done := make(chan struct{})
 		go func() {
 			proc.cmd.Wait()
@@ -701,11 +744,18 @@ func (m *Manager) stopProcess(proc *managed) {
 		case <-done:
 			// Process exited gracefully
 		case <-time.After(stopTimeout):
-			// Force kill process group
+			// Force kill the whole process group, then wait for the Wait goroutine
+			// to unwind. WaitDelay bounds it; the extra cap is a hard safety net so
+			// stopProcess can never block forever. Do NOT call cmd.Wait again here -
+			// the goroutine above already owns the single Wait call.
 			if pgid > 0 {
 				syscall.Kill(-pgid, syscall.SIGKILL)
 			}
-			proc.cmd.Wait()
+			waitDelay := resolveTimeout(proc.config.WaitDelay, 10*time.Second)
+			select {
+			case <-done:
+			case <-time.After(waitDelay + 2*time.Second):
+			}
 		}
 	}
 
@@ -821,6 +871,16 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 	m.mu.Unlock()
 
 	time.Sleep(delay)
+
+	// Re-check stop intent: the user may have called Stop during the backoff
+	// window, which closes stopCh. Without this, the process would be resurrected
+	// despite an explicit stop.
+	select {
+	case <-proc.stopCh:
+		return
+	default:
+	}
+
 	if err := m.startInstance(proc.config, key, proc.instance, proc.port); err != nil {
 		m.mu.Lock()
 		proc.status = StatusErrored
@@ -863,7 +923,16 @@ func (m *Manager) monitorAdopted(proc *managed, key string) {
 				m.mu.Unlock()
 
 				if proc.config != nil && proc.config.Name != "" {
-					m.startInstance(proc.config, key, proc.instance, proc.port)
+					if err := m.startInstance(proc.config, key, proc.instance, proc.port); err != nil {
+						// Restart failed - keep the entry visible as errored instead
+						// of silently dropping it from management entirely.
+						m.mu.Lock()
+						proc.status = StatusErrored
+						m.processes[key] = proc
+						m.persistProcess(proc, key)
+						m.mu.Unlock()
+						m.notifyStatusChange(key, StatusErrored)
+					}
 				}
 				return
 			}

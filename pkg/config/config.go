@@ -84,6 +84,10 @@ type ProcessConfig struct {
 	MaxRestarts   int    `yaml:"max_restarts,omitempty" json:"max_restarts,omitempty"`
 	StopSignal    string `yaml:"stop_signal,omitempty" json:"stop_signal,omitempty"`     // SIGTERM, SIGKILL, SIGINT, SIGQUIT
 	StopTimeout   string `yaml:"stop_timeout,omitempty" json:"stop_timeout,omitempty"`   // e.g. "10s"
+	// WaitDelay caps how long cmd.Wait blocks on output pipes after the process
+	// exits. A grandchild that inherits the stdout/stderr pipe can otherwise keep
+	// it open forever and hang Wait (and poison the Manager mutex). Default "10s".
+	WaitDelay string `yaml:"wait_delay,omitempty" json:"wait_delay,omitempty"` // e.g. "10s"
 
 	Nginx *ProcessNginxConfig `yaml:"nginx,omitempty" json:"nginx,omitempty"`
 

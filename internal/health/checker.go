@@ -1,11 +1,13 @@
 package health
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/depfloy/dpm/pkg/config"
@@ -63,14 +65,21 @@ func (c *Checker) StartMonitoring(name string, port int, cfg *config.HealthCheck
 		return
 	}
 
-	// Stop old monitor and wait for it to exit
-	c.StopMonitoring(name)
-	c.mu.RLock()
-	doneCh := c.doneChs[name]
-	c.mu.RUnlock()
-	if doneCh != nil {
+	// Stop any existing monitor and capture its done channel under the lock, so we
+	// can wait for the old goroutine to fully exit before starting a new one. This
+	// prevents two goroutines concurrently writing c.statuses[name].
+	c.mu.Lock()
+	if stopCh, ok := c.stopChs[name]; ok {
+		close(stopCh)
+		delete(c.stopChs, name)
+	}
+	oldDone := c.doneChs[name]
+	delete(c.doneChs, name)
+	c.mu.Unlock()
+
+	if oldDone != nil {
 		select {
-		case <-doneCh:
+		case <-oldDone:
 		case <-time.After(10 * time.Second):
 		}
 	}
@@ -162,6 +171,10 @@ func (c *Checker) StopMonitoring(name string) {
 		close(stopCh)
 		delete(c.stopChs, name)
 	}
+	// Clean up the remaining per-process entries so the maps don't grow unbounded
+	// as processes are created and removed over the daemon's lifetime.
+	delete(c.doneChs, name)
+	delete(c.statuses, name)
 }
 
 // GetStatus returns the current health status of a process.
@@ -277,37 +290,47 @@ func (c *Checker) checkTCP(port int, timeout time.Duration, start time.Time) *St
 }
 
 func (c *Checker) checkExec(command string, timeout time.Duration, start time.Time) *Status {
-	cmd := exec.Command("sh", "-c", command)
-	done := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	go func() {
-		done <- cmd.Run()
-	}()
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	// Run in its own process group so the timeout kills the whole tree, not just
+	// the shell - otherwise child processes spawned by the command are orphaned.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// On timeout, os/exec invokes Cancel (only after Start, so cmd.Process is set
+	// and safe to read here - no concurrent access). Kill the whole group.
+	cmd.Cancel = func() error {
+		if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
+			return syscall.Kill(-pgid, syscall.SIGKILL)
+		}
+		return cmd.Process.Kill()
+	}
 
-	select {
-	case err := <-done:
-		elapsed := time.Since(start)
-		if err != nil {
-			return &Status{
-				Healthy:      false,
-				CheckType:    "exec",
-				Message:      fmt.Sprintf("command failed: %v", err),
-				ResponseTime: elapsed,
-			}
-		}
-		return &Status{
-			Healthy:      true,
-			CheckType:    "exec",
-			Message:      "exit 0",
-			ResponseTime: elapsed,
-		}
-	case <-time.After(timeout):
-		cmd.Process.Kill()
+	// Run blocks in this goroutine until the command exits or ctx kills it, so
+	// there is no concurrent access to cmd's fields.
+	err := cmd.Run()
+	elapsed := time.Since(start)
+
+	if ctx.Err() == context.DeadlineExceeded {
 		return &Status{
 			Healthy:      false,
 			CheckType:    "exec",
 			Message:      "timeout",
 			ResponseTime: timeout,
 		}
+	}
+	if err != nil {
+		return &Status{
+			Healthy:      false,
+			CheckType:    "exec",
+			Message:      fmt.Sprintf("command failed: %v", err),
+			ResponseTime: elapsed,
+		}
+	}
+	return &Status{
+		Healthy:      true,
+		CheckType:    "exec",
+		Message:      "exit 0",
+		ResponseTime: elapsed,
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -492,6 +493,89 @@ func TestDrainNoOp(t *testing.T) {
 	}
 }
 
+// ==================== WaitDelay: inherited-pipe hang (DP-92) ====================
+
+// TestStopReturnsWhenGrandchildHoldsPipe reproduces the DP-92 deadlock root cause:
+// `sh -c "sleep 300 &"` exits immediately but the backgrounded grandchild inherits
+// the stdout pipe and keeps it open, so the os/exec copy goroutine never sees EOF
+// and cmd.Wait() would hang forever. cmd.WaitDelay must force the pipe closed so
+// Wait returns, the monitor records the exit, and the Manager mutex is never
+// poisoned. Without WaitDelay this test hangs (status never leaves "starting").
+func TestStopReturnsWhenGrandchildHoldsPipe(t *testing.T) {
+	mgr, _ := testManager(t)
+
+	cfg := testConfig("pipe-hang-app", "sleep 300 &")
+	cfg.RestartPolicy = "never" // exits once; we only care that Wait unblocks
+	cfg.WaitDelay = "1s"
+	cfg.StopTimeout = "1s"
+
+	if err := mgr.Start(cfg, nil); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Capture the shell's PID so we can reap the orphaned `sleep` grandchild after
+	// the test (its process group id equals the original shell PID).
+	var shellPID int
+	for _, info := range mgr.List() {
+		if info.Name == "pipe-hang-app" {
+			shellPID = info.PID
+		}
+	}
+	t.Cleanup(func() {
+		if shellPID > 0 {
+			syscall.Kill(-shellPID, syscall.SIGKILL)
+		}
+	})
+
+	// The monitor calls cmd.Wait() after the shell exits. WaitDelay (1s) must make
+	// that Wait return despite the grandchild holding the pipe, so the process is
+	// recorded as stopped well within this window. Without the fix it hangs and the
+	// status stays "starting" until this loop times out.
+	deadline := time.Now().Add(10 * time.Second)
+	got := ""
+	for time.Now().Before(deadline) {
+		found := false
+		for _, info := range mgr.List() {
+			if info.Name == "pipe-hang-app" {
+				found = true
+				got = info.Status
+			}
+		}
+		if !found || got == StatusStopped {
+			got = StatusStopped
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got != StatusStopped {
+		t.Fatalf("cmd.Wait did not unblock: status=%q, want stopped (WaitDelay should force the inherited pipe closed)", got)
+	}
+
+	// Mutex must be free: Stop must return promptly and not block other operations.
+	stopDone := make(chan struct{})
+	go func() {
+		mgr.Stop("pipe-hang-app")
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+	case <-time.After(8 * time.Second):
+		t.Fatal("Stop did not return - Manager mutex appears poisoned")
+	}
+
+	// A concurrent read operation must remain responsive.
+	listDone := make(chan struct{})
+	go func() {
+		_ = mgr.List()
+		close(listDone)
+	}()
+	select {
+	case <-listDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("List blocked - Manager mutex held during blocking stop")
+	}
+}
+
 // ==================== startInstance Error Handling in Monitor ====================
 
 func TestStartInstanceErrorMarksErrored(t *testing.T) {
@@ -532,6 +616,76 @@ func TestStartInstanceErrorMarksErrored(t *testing.T) {
 			}
 		}
 	}
+}
+
+// ==================== Stop During Restart Backoff ====================
+
+// TestStopDuringRestartBackoff verifies that a Stop issued while a crashing
+// process is in its restart-backoff window is honored - the process must NOT be
+// resurrected after the backoff sleep elapses. This guards the stopCh re-check
+// added to monitor() after time.Sleep(delay).
+func TestStopDuringRestartBackoff(t *testing.T) {
+	mgr, _ := testManager(t)
+
+	// A command that crashes immediately and is configured to always restart, so
+	// the manager spends most of its time in the backoff window between restarts.
+	cfg := testConfig("backoff-app", "exit 1")
+	cfg.RestartPolicy = "always"
+	cfg.MaxRestarts = 50
+
+	if err := mgr.Start(cfg, nil); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Wait until the restart loop is clearly active (a couple of restarts in),
+	// which means the process is cycling through the backoff window.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if r := restartCountOf(mgr, "backoff-app"); r >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if restartCountOf(mgr, "backoff-app") < 2 {
+		t.Fatal("process never entered an active restart loop")
+	}
+
+	// Stop it. With the fix, the in-flight backoff goroutine re-checks stopCh and
+	// returns without restarting.
+	if err := mgr.Stop("backoff-app"); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	// Observe for several seconds (spanning multiple backoff cycles). The process
+	// must never come back to a live state.
+	watch := time.Now().Add(6 * time.Second)
+	for time.Now().Before(watch) {
+		for _, info := range mgr.List() {
+			if info.Name == "backoff-app" {
+				if info.Status == StatusOnline || info.Status == StatusStarting {
+					t.Fatalf("process was resurrected after Stop: status=%s", info.Status)
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Final state must be stopped.
+	for _, info := range mgr.List() {
+		if info.Name == "backoff-app" && info.Status != StatusStopped {
+			t.Errorf("final status = %s, want stopped", info.Status)
+		}
+	}
+}
+
+// restartCountOf returns the restart count for the named process, or -1.
+func restartCountOf(m *Manager, name string) int {
+	for _, info := range m.List() {
+		if info.Name == name {
+			return info.RestartCount
+		}
+	}
+	return -1
 }
 
 // ==================== Concurrent Start/Stop Safety ====================
