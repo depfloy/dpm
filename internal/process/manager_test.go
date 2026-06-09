@@ -2,6 +2,7 @@ package process
 
 import (
 	"encoding/json"
+	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
@@ -308,27 +309,26 @@ func TestReloadAllCompletesWithinTimeout(t *testing.T) {
 func TestReloadAllWithAdoptedProcesses(t *testing.T) {
 	mgr, store := testManager(t)
 
-	// Start a real process
-	cfg := testConfig("adopted-test", "sleep 300")
-	if err := mgr.Start(cfg, nil); err != nil {
-		t.Fatalf("start: %v", err)
+	// Spawn a real long-lived process directly (NOT via the manager) to get a live
+	// PID, then adopt it exactly the way the daemon does after a restart: Attach
+	// builds a managed entry with cmd=nil and a monitorAdopted goroutine (which
+	// polls the PID and never touches proc.cmd). This mirrors production and avoids
+	// the data race that manually nil-ing a live, monitored process's cmd would
+	// cause (monitor reads proc.cmd in cmd.Wait() without the lock).
+	helper := exec.Command("sleep", "300")
+	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := helper.Start(); err != nil {
+		t.Fatalf("spawn helper process: %v", err)
 	}
+	pid := helper.Process.Pid
+	t.Cleanup(func() {
+		syscall.Kill(-pid, syscall.SIGKILL)
+		helper.Wait()
+	})
 
-	// Wait for it to be online
-	waitForStatus(mgr, "adopted-test", StatusOnline, 5*time.Second)
-
-	// Simulate an adopted process state: set cmd to nil, mimicking what
-	// happens after daemon restart + Attach. Get the PID from the real process.
-	mgr.mu.Lock()
-	proc := mgr.processes["adopted-test"]
-	pid := proc.pid
-	// Simulate adopted state: keep pid, nil out cmd (as Attach does)
-	proc.cmd = nil
-	mgr.mu.Unlock()
-
-	// Also save the process state to BoltDB so ReloadAll can find it
+	cfg := testConfig("adopted-test", "sleep 300")
 	cfgJSON, _ := json.Marshal(cfg)
-	store.SaveProcess(&state.ProcessState{
+	ps := &state.ProcessState{
 		Name:       "adopted-test",
 		PID:        pid,
 		Port:       0,
@@ -337,15 +337,19 @@ func TestReloadAllWithAdoptedProcesses(t *testing.T) {
 		CWD:        cfg.CWD,
 		Type:       cfg.Type,
 		ConfigJSON: cfgJSON,
-	})
+	}
+	store.SaveProcess(ps)
 
-	// ReloadAll should not panic or deadlock when encountering cmd=nil processes
+	if err := mgr.Attach(ps); err != nil {
+		t.Fatalf("attach adopted process: %v", err)
+	}
+
+	// ReloadAll should not panic or deadlock when encountering cmd=nil processes.
 	done := make(chan struct{})
 	var reloadErr error
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				reloadErr = nil // We'll check for panic separately
 				t.Errorf("ReloadAll panicked with adopted process: %v", r)
 			}
 			close(done)
@@ -363,7 +367,7 @@ func TestReloadAllWithAdoptedProcesses(t *testing.T) {
 	// Allow some error - the important thing is no panic or deadlock
 	t.Logf("ReloadAll with adopted process result: err=%v", reloadErr)
 
-	// Clean up
+	// Clean up any processes the reload may have spawned.
 	time.Sleep(1 * time.Second)
 	for _, info := range mgr.List() {
 		mgr.Stop(info.Name)
