@@ -566,14 +566,30 @@ func (m *Manager) Delete(name string) error {
 		// Process might already be stopped, continue with deletion
 	}
 
+	// Old blue-green workers parked in pendingDrain (Drain not yet called) are
+	// NOT in m.processes, so Stop() above misses them. Their monitor goroutines
+	// are still live and would resurrect the process (RestartPolicy "always")
+	// when it next exits — silently undoing the delete (Server 46 incident,
+	// DP-98). Signal-stop them under the lock so the monitors see the stop
+	// intent, then reap them lock-free below.
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	parked := m.pendingDrain[name]
+	delete(m.pendingDrain, name)
+	for _, proc := range parked {
+		m.signalStop(proc)
+	}
 
 	for key, proc := range m.processes {
 		if proc.config.Name == name {
 			delete(m.processes, key)
 			m.store.DeleteProcess(key)
 		}
+	}
+	m.mu.Unlock()
+
+	// Blocking kill/wait outside the lock (see stopProcess docs).
+	for _, proc := range parked {
+		m.stopProcess(proc)
 	}
 	return nil
 }
