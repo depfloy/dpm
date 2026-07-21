@@ -162,7 +162,7 @@ Required fields: `name`, `command`.
 | `max_restarts` | int | `0` (unlimited) | Maximum restart attempts |
 | `stop_signal` | string | `"SIGTERM"` | Signal to send on stop: `SIGTERM`, `SIGKILL`, `SIGINT`, `SIGQUIT` |
 | `stop_timeout` | string | `"10s"` | Time to wait for graceful shutdown before SIGKILL |
-| `resources` | object | | Resource limits |
+| `resources` | object | | Resource limits. `max_memory` (e.g. `"512MB"`) triggers a graceful restart when a process's RSS stays over the limit for ~15s, after a 60s post-start warm-up; memory restarts count against `max_restarts` so a runaway process eventually stops. Limits below 32MB are ignored. `max_cpu` is accepted but not yet enforced. |
 | `nginx` | object | | Nginx proxy configuration |
 | `workers` | array | | Sub-worker processes attached to this process |
 
