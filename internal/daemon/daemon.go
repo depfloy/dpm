@@ -310,6 +310,7 @@ func (d *Daemon) startAPI() error {
 		d.store,
 		d.config,
 		d.logger,
+		Version,
 	)
 
 	d.listener = listener

@@ -56,15 +56,17 @@ func NewRouter(
 	store *state.Store,
 	cfg *config.DaemonConfig,
 	logger *slog.Logger,
+	version string,
 ) http.Handler {
 	r := &Router{
-		pm:     pm,
-		ports:  ports,
-		nginx:  nginxMgr,
-		health: hc,
-		store:  store,
-		config: cfg,
-		logger: logger,
+		pm:      pm,
+		ports:   ports,
+		nginx:   nginxMgr,
+		health:  hc,
+		store:   store,
+		config:  cfg,
+		logger:  logger,
+		version: version,
 	}
 
 	mux := http.NewServeMux()
@@ -779,8 +781,20 @@ func (r *Router) handleVersion(w http.ResponseWriter, req *http.Request) {
 	}
 
 	r.successResponse(w, map[string]string{
-		"version": "dev",
+		"version": r.reportedVersion(),
 	})
+}
+
+// reportedVersion is the daemon's own version, as stamped into the binary at
+// build time. An unstamped local build reports "dev", which stays the honest
+// answer — but a released daemon must report its release, or a fleet cannot be
+// inventoried and `dpm version` cannot tell a mismatched CLI from a healthy one.
+func (r *Router) reportedVersion() string {
+	if r.version == "" {
+		return "dev"
+	}
+
+	return r.version
 }
 
 func (r *Router) handleReload(w http.ResponseWriter, req *http.Request) {
@@ -829,7 +843,7 @@ func (r *Router) successResponse(w http.ResponseWriter, data interface{}) {
 	json.NewEncoder(w).Encode(Response{
 		Status: "success",
 		Data:   data,
-		Meta:   Meta{Version: "dev"},
+		Meta:   Meta{Version: r.reportedVersion()},
 	})
 }
 
@@ -839,7 +853,7 @@ func (r *Router) errorResponse(w http.ResponseWriter, code int, message string) 
 	json.NewEncoder(w).Encode(Response{
 		Status: "error",
 		Error:  message,
-		Meta:   Meta{Version: "dev"},
+		Meta:   Meta{Version: r.reportedVersion()},
 	})
 }
 

@@ -18,8 +18,12 @@ jobs:
         with:
           go-version: '1.23'
 
+      # Every package, not a hand-picked four. The old list left out
+      # internal/process — where restart policy, drain and memory enforcement
+      # live — so the gate on a release skipped the code most able to take a
+      # fleet down. 1.9.0 shipped that package tested only on a laptop.
       - name: Run tests
-        run: go test -v ./internal/log/... ./internal/port/... ./internal/state/... ./pkg/config/...
+        run: go test ./...
 
       - name: Build binaries
         run: make build-linux VERSION=${GITHUB_REF_NAME#v}
