@@ -67,6 +67,16 @@ type Manager struct {
 	maxLogBackups  int
 	logCompress    bool
 	onStatusChange func(name, status string)
+
+	// Memory-limit enforcement (max_memory_restart). Defaulted in NewManager and
+	// overridable per-instance in tests. readMemory is injectable so tests can
+	// script RSS without a real /proc; onMemoryLimit is an observability hook.
+	memInterval   time.Duration
+	memWarmup     time.Duration
+	memBreaches   int
+	memFloor      uint64
+	readMemory    func(pid int) uint64
+	onMemoryLimit func(name string, rss, limit uint64)
 }
 
 // NewManager creates a new process manager.
@@ -79,12 +89,28 @@ func NewManager(store *state.Store, logDir string, rotation config.RotationConfi
 		maxLogSize:   dpmlog.ParseMaxSize(rotation.MaxSize),
 		maxLogBackups: rotation.MaxBackups,
 		logCompress:  rotation.Compress,
+
+		// Memory-limit enforcement defaults. An instance must be up for memWarmup
+		// AND over its limit for memBreaches consecutive samples before a restart,
+		// so boot spikes and short GC-precollection bursts never trigger one.
+		memInterval: 5 * time.Second,
+		memWarmup:   60 * time.Second,
+		memBreaches: 3,
+		memFloor:    32 * 1024 * 1024, // ignore any limit below 32MB (likely a mistake)
+		readMemory:  getProcessMemory,
 	}
 }
 
 // OnStatusChange registers a callback for process status changes.
 func (m *Manager) OnStatusChange(fn func(name, status string)) {
 	m.onStatusChange = fn
+}
+
+// OnMemoryLimit registers a callback fired when a process is restarted for
+// exceeding its configured max_memory. Set once at startup before any process
+// starts, so the sampler reads it lock-free (like onStatusChange).
+func (m *Manager) OnMemoryLimit(fn func(name string, rss, limit uint64)) {
+	m.onMemoryLimit = fn
 }
 
 // Start launches a new process based on the given config.
@@ -219,6 +245,11 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 
 	// Monitor process in background
 	go m.monitor(proc, key, logFile, errFile)
+
+	// Enforce max_memory if a real limit is configured.
+	if limit := parseMemoryLimit(cfg, m.memFloor); limit > 0 {
+		go m.monitorMemory(proc, key, limit)
+	}
 
 	return nil
 }
@@ -699,6 +730,12 @@ func (m *Manager) Attach(ps *state.ProcessState) error {
 	// Monitor the re-adopted process
 	go m.monitorAdopted(proc, ps.Name)
 
+	// Enforce max_memory if a real limit is configured. The warm-up window gives
+	// adopted processes a fresh grace period after a daemon restart.
+	if limit := parseMemoryLimit(&cfg, m.memFloor); limit > 0 {
+		go m.monitorMemory(proc, ps.Name, limit)
+	}
+
 	return nil
 }
 
@@ -1068,6 +1105,142 @@ func waitForExit(pid int, timeout time.Duration) bool {
 			return false
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// parseMemoryLimit converts a process's configured max_memory ("512MB", "1GB")
+// to bytes. Unlike dpmlog.ParseMaxSize (which falls back to 100MB on a bad
+// value), it returns 0 = "no limit / disabled" for a nil/empty/unparseable/zero
+// value or one below floor — so a process without a real limit is never enforced
+// by accident, and a typo like "0" or "5MB" disables enforcement rather than
+// imposing a dangerously low cap.
+func parseMemoryLimit(cfg *config.ProcessConfig, floor uint64) uint64 {
+	if cfg == nil || cfg.Resources == nil {
+		return 0
+	}
+	s := strings.TrimSpace(strings.ToUpper(cfg.Resources.MaxMemory))
+	if s == "" {
+		return 0
+	}
+
+	var multiplier uint64 = 1
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "MB"):
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "KB"):
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+
+	val, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil || val == 0 {
+		return 0
+	}
+	limit := val * multiplier
+	if limit < floor {
+		return 0
+	}
+	return limit
+}
+
+// memInstanceManaged reports whether proc is still an active managed instance
+// (a value in m.processes), as opposed to one parked in pendingDrain during a
+// blue-green deploy or superseded by a redeploy. The caller MUST hold m.mu.
+// The memory sampler uses this so it never acts on a drained/replaced worker —
+// crucially, never resurrecting a parked worker (DP-98).
+func (m *Manager) memInstanceManaged(proc *managed) bool {
+	for _, p := range m.processes {
+		if p == proc {
+			return true
+		}
+	}
+	return false
+}
+
+// monitorMemory samples a process's RSS and restarts it once it stays above its
+// configured max_memory for memBreaches consecutive samples. One goroutine per
+// instance, mirroring monitor/monitorAdopted, tied to proc.stopCh so Stop/
+// Restart/Delete/Drain tear it down for free. The hysteresis counter is
+// goroutine-local, so there is no new shared state.
+//
+// Mutex discipline (load-bearing — holding m.mu across /proc or a kill has
+// deadlocked the daemon before): each tick takes only a brief RLock to snapshot
+// proc.pid and confirm proc is still managed, then releases it before the /proc
+// read and the (blocking) stopProcess call.
+func (m *Manager) monitorMemory(proc *managed, key string, limit uint64) {
+	defer func() { _ = recover() }()
+
+	// Warm-up grace: never enforce during boot / JIT / first-request compile
+	// spikes. Counted from goroutine start, which also gives an adopted process a
+	// fresh grace window after a daemon restart. Abortable by an intentional stop.
+	select {
+	case <-proc.stopCh:
+		return
+	case <-time.After(m.memWarmup):
+	}
+
+	ticker := time.NewTicker(m.memInterval)
+	defer ticker.Stop()
+
+	over := 0
+	for {
+		select {
+		case <-proc.stopCh:
+			return
+		case <-ticker.C:
+			// Snapshot under a brief read lock, then release before any I/O.
+			m.mu.RLock()
+			tracked := m.memInstanceManaged(proc)
+			pid := proc.pid
+			m.mu.RUnlock()
+
+			if !tracked {
+				return // drained, deleted, or replaced by a redeploy
+			}
+
+			rss := m.readMemory(pid)
+			// A zero read (process exited between snapshot and read, or non-Linux)
+			// is treated as under-limit so a race never counts as a breach.
+			if rss == 0 || rss <= limit {
+				over = 0
+				continue
+			}
+
+			over++
+			if over < m.memBreaches {
+				continue
+			}
+
+			// Sustained breach. Re-check stop intent and management, then restart by
+			// calling stopProcess WITHOUT signalStop: the monitor/monitorAdopted
+			// goroutine sees the process die with stopCh still open and resurrects it
+			// via the normal restart_policy path. So a memory restart counts against
+			// maxRestarts and the fast-crash guard, and an OOM-looping app eventually
+			// stops. We return after one action; monitor owns the actual restart.
+			select {
+			case <-proc.stopCh:
+				return
+			default:
+			}
+			m.mu.RLock()
+			tracked = m.memInstanceManaged(proc)
+			m.mu.RUnlock()
+			if !tracked {
+				return
+			}
+
+			if m.onMemoryLimit != nil {
+				m.onMemoryLimit(key, rss, limit)
+			}
+			m.stopProcess(proc)
+			return
+		}
 	}
 }
 

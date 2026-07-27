@@ -79,6 +79,14 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 		logger.Info("process status changed", "name", name, "status", status)
 	})
 
+	pm.OnMemoryLimit(func(name string, rss, limit uint64) {
+		logger.Warn("memory limit exceeded, restarting",
+			"name", name,
+			"rss_bytes", rss,
+			"limit_bytes", limit,
+		)
+	})
+
 	d := &Daemon{
 		config:         cfg,
 		store:          store,

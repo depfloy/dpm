@@ -12,7 +12,7 @@ DPM is a lightweight process manager built for production Linux servers. It mana
 - **Connection draining** -- graceful shutdown waits for active requests to complete before stopping workers
 - **Persistent state** -- BoltDB-backed state survives daemon restarts; orphan processes are re-adopted automatically
 - **Log management** -- per-process stdout/stderr log files with rotation (size, age, compression)
-- **Resource limits** -- configurable memory and CPU constraints per process
+- **Memory limits** -- restart a process gracefully when its RSS stays over `max_memory` (PM2-style `max_memory_restart`)
 - **Single binary** -- the same binary serves as both the CLI (`dpm`) and the daemon (`dpmd`)
 
 ## Installation
@@ -172,7 +172,9 @@ health_check:
   unhealthy_threshold: 3
 
 resources:
-  max_memory: 512MB
+  max_memory: 512MB             # RSS over this for ~15s (after a 60s warm-up)
+                                # triggers a graceful restart. max_cpu is not
+                                # enforced yet.
 
 restart_policy: always          # always, on-failure, never
 restart_delay: 1s
