@@ -232,13 +232,23 @@ func TestStartRunsProcessAsConfiguredUser(t *testing.T) {
 		t.Skip("run as root to prove the process actually changes user")
 	}
 
-	target, err := user.Lookup("nobody")
-	if err != nil {
-		t.Skipf("no nobody user to drop to: %v", err)
+	target, lookupErr := user.Lookup("nobody")
+	if lookupErr != nil {
+		t.Skipf("no nobody user to drop to: %v", lookupErr)
 	}
 
 	manager, _ := testManager(t)
-	outputDir := t.TempDir()
+
+	// Not t.TempDir(): it nests the directory under a 0700 parent, so nobody
+	// cannot traverse into it however open the leaf is, and the probe would fail
+	// for a reason that has nothing to do with the privilege drop. One level
+	// under /tmp, which is world-traversable.
+	outputDir, err := os.MkdirTemp("/tmp", "dpm-user-probe")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(outputDir) })
+
 	// World-writable: nobody has to be able to write the result, which is itself
 	// part of what is being checked — a process that cannot write anything looks
 	// the same as one that never ran.

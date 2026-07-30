@@ -25,6 +25,15 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      # The privilege drop is the one behaviour the suite above cannot check:
+      # dropping privileges requires having them, so as an ordinary runner the
+      # test skips and the suite goes green either way. Without this step a
+      # release could ship a broken privilege drop — the failure mode being
+      # customer applications running as root, which is what the change exists
+      # to stop, or failing to start at all.
+      - name: Verify processes drop privileges (needs root)
+        run: sudo -E $(which go) test ./internal/process/ -run TestStartRunsProcessAsConfiguredUser -v
+
       - name: Build binaries
         run: make build-linux VERSION=${GITHUB_REF_NAME#v}
 
