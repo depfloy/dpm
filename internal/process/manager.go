@@ -194,6 +194,22 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 		env = append(env, fmt.Sprintf("%s=%d", portEnv, port))
 	}
 
+	// Drop to the configured user, if there is one. Resolved before the process
+	// is built so an unknown user fails here rather than starting something as
+	// root and reporting success.
+	credential, err := credentialFor(cfg.User)
+	if err != nil {
+		return fmt.Errorf("resolve user for %s: %w", cfg.Name, err)
+	}
+
+	if credential != nil {
+		// HOME still says /root at this point, inherited from the daemon. A
+		// process that cannot write its own cache directory fails in a way that
+		// looks like a broken release, so the identity variables move with the
+		// credentials.
+		env = environForUser(env, cfg.User)
+	}
+
 	// Build command - use shell to handle complex commands
 	cmd := exec.Command("sh", "-c", cfg.Command)
 	cmd.Dir = cfg.CWD // Symlink path, NOT resolved
@@ -201,7 +217,8 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 
 	// Set process group so we can kill the whole tree
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+		Setpgid:    true,
+		Credential: credential,
 	}
 
 	// Cap how long cmd.Wait blocks on the stdout/stderr copy goroutines after the
