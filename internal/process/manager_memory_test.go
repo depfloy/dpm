@@ -73,25 +73,36 @@ func TestMemoryLimitTriggersRestart(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	// A live process kept over its limit must be restarted repeatedly. Poll for
-	// two restarts — comfortably before the fast-crash guard (5) stops it.
+	// A live process kept over its limit must be replaced repeatedly.
 	deadline := time.Now().Add(15 * time.Second)
-	var restarts int
+	var recycles, restarts int
 	for time.Now().Before(deadline) {
 		for _, info := range mgr.List() {
-			if info.Name == "mem-app" && info.RestartCount > restarts {
+			if info.Name != "mem-app" {
+				continue
+			}
+			if info.MemoryRecycles > recycles {
+				recycles = info.MemoryRecycles
+			}
+			if info.RestartCount > restarts {
 				restarts = info.RestartCount
 			}
 		}
-		if restarts >= 2 {
+		if recycles >= 2 {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	_ = mgr.Stop("mem-app")
 
-	if restarts < 2 {
-		t.Errorf("restart count = %d, want >= 2 (memory limit should drive restarts)", restarts)
+	if recycles < 2 {
+		t.Errorf("memory recycles = %d, want >= 2 (memory limit should drive replacements)", recycles)
+	}
+	// The recycle is a replacement we asked for, so it must not spend the crash
+	// budget. When it did, an application that only ever needed more memory than
+	// its ceiling walked to maxRestarts and was stopped for good.
+	if restarts != 0 {
+		t.Errorf("restart count = %d, want 0 (a memory recycle is not a crash)", restarts)
 	}
 	if atomic.LoadInt32(&fired) == 0 {
 		t.Error("onMemoryLimit callback never fired")
@@ -140,9 +151,24 @@ func TestMemoryHysteresisNoRestartOnSpike(t *testing.T) {
 	}
 }
 
-// ==================== OOM loop eventually stops (flapping guard) ====================
+// ==================== OOM loop keeps the application serving ====================
 
-func TestMemoryOOMLoopEventuallyStops(t *testing.T) {
+// This reverses the original contract, which was that "a genuinely runaway
+// process eventually stops instead of flapping forever" — a side effect of
+// routing memory restarts through the crash path rather than an independent
+// safety requirement.
+//
+// For a process behind a proxy, stopping is the worst available outcome: DPM
+// removes the only listener and nginx returns 502 for every request until a
+// human deploys. That is not hypothetical — commerce-v1 storefronts run above
+// their ceiling continuously, so they spend the crash budget on recycles alone
+// and reach maxRestarts having never once failed.
+//
+// The anti-thrash property is kept, but it comes from the warm-up window, not
+// from the cap: monitorMemory waits memWarmup after every start before it can
+// fire again, so recycles are bounded to roughly one per warm-up period no
+// matter how fat the process is. In production that is 60s.
+func TestMemoryOOMLoopKeepsServing(t *testing.T) {
 	mgr, _ := testManager(t)
 
 	mgr.memWarmup = 0
@@ -152,17 +178,99 @@ func TestMemoryOOMLoopEventuallyStops(t *testing.T) {
 	mgr.readMemory = func(int) uint64 { return 200 * 1024 * 1024 } // always over
 
 	cfg := memConfig("oom-app", "sleep 300", "100MB")
-	cfg.MaxRestarts = 3 // stop after a few memory restarts, deterministically
+	cfg.MaxRestarts = 3 // the crash cap a recycle must no longer consume
 	if err := mgr.Start(cfg, nil); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 
-	// A process restarted for memory participates in the restart counters, so an
-	// endlessly-fat app hits MaxRestarts and stops instead of flapping forever.
-	got := waitForStatus(mgr, "oom-app", StatusStopped, 25*time.Second)
+	// Recycle well past MaxRestarts. Under the old contract the process would
+	// have been stopped at 3; it must still be coming back here.
+	deadline := time.Now().Add(20 * time.Second)
+	var recycles, restarts int
+	var everStopped bool
+	for time.Now().Before(deadline) {
+		for _, info := range mgr.List() {
+			if info.Name != "oom-app" {
+				continue
+			}
+			if info.MemoryRecycles > recycles {
+				recycles = info.MemoryRecycles
+			}
+			if info.RestartCount > restarts {
+				restarts = info.RestartCount
+			}
+			if info.Status == StatusStopped {
+				everStopped = true
+			}
+		}
+		if recycles > cfg.MaxRestarts*2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	_ = mgr.Stop("oom-app")
 
-	if got != StatusStopped {
-		t.Errorf("status = %q, want stopped (OOM loop must hit the restart cap)", got)
+	if recycles <= cfg.MaxRestarts {
+		t.Errorf("memory recycles = %d, want > MaxRestarts (%d): the crash cap must not stop a recycle loop",
+			recycles, cfg.MaxRestarts)
+	}
+	if everStopped {
+		t.Error("process reached stopped: an over-limit application must keep being replaced, not left dead")
+	}
+	if restarts != 0 {
+		t.Errorf("restart count = %d, want 0 (recycles are not crashes)", restarts)
+	}
+}
+
+// ==================== A recycle does not pay the crash backoff ====================
+
+// restartBackoff climbs to 30s past ten restarts. A single-instance site is
+// serving nothing for that entire window, so a planned recycle must not wait
+// it out.
+//
+// The assertion is a budget rather than a stopwatch. A cycle here costs about
+// 2.5s regardless of this change, because monitor sleeps 2s before marking the
+// process online and only calls Wait() afterwards — that delay is bookkeeping,
+// not downtime, since the process is already accepting connections. Six cycles
+// therefore need ~15s now. Under the old backoff the sleeps alone would be
+// 1+2+2+5+5+10 = 25s on top of that, so six inside this window is only
+// reachable without the backoff.
+func TestMemoryRecycleSkipsCrashBackoff(t *testing.T) {
+	mgr, _ := testManager(t)
+
+	mgr.memWarmup = 0
+	mgr.memInterval = 30 * time.Millisecond
+	mgr.memBreaches = 1
+	mgr.memFloor = 1
+	mgr.readMemory = func(int) uint64 { return 200 * 1024 * 1024 }
+
+	cfg := memConfig("fast-recycle-app", "sleep 300", "100MB")
+	if err := mgr.Start(cfg, nil); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	const want = 6
+	start := time.Now()
+	deadline := start.Add(20 * time.Second)
+	var recycles int
+	for time.Now().Before(deadline) {
+		for _, info := range mgr.List() {
+			if info.Name == "fast-recycle-app" && info.MemoryRecycles > recycles {
+				recycles = info.MemoryRecycles
+			}
+		}
+		if recycles >= want {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	_ = mgr.Stop("fast-recycle-app")
+
+	if recycles < want {
+		t.Errorf("memory recycles = %d in 20s, want >= %d (recycles appear to be paying restartBackoff)",
+			recycles, want)
+	}
+	if elapsed := time.Since(start); recycles >= want && elapsed > 18*time.Second {
+		t.Errorf("reached %d recycles only after %s — too close to the budget to prove anything", recycles, elapsed)
 	}
 }

@@ -41,19 +41,34 @@ type Info struct {
 	Command      string            `json:"command"`
 	CWD          string            `json:"cwd"`
 	Env          map[string]string `json:"env,omitempty"`
+
+	// Replacements driven by the memory watchdog, counted apart from
+	// RestartCount because they are planned recycles rather than crashes. A
+	// caller reading "restarts: 40" should not be looking at an application
+	// that has never actually failed.
+	MemoryRecycles int `json:"memory_recycles"`
 }
 
 // managed represents a single running process instance.
 type managed struct {
-	config   *config.ProcessConfig
-	cmd      *exec.Cmd
-	pid      int
-	port     int
-	instance int // instance index (0, 1, ...)
-	status   string
+	config    *config.ProcessConfig
+	cmd       *exec.Cmd
+	pid       int
+	port      int
+	instance  int // instance index (0, 1, ...)
+	status    string
 	startedAt time.Time
-	restarts int
-	stopCh   chan struct{}
+	restarts  int
+	stopCh    chan struct{}
+
+	// Set by monitorMemory immediately before it kills the process, so the
+	// monitor goroutine can tell a planned recycle from a crash when Wait()
+	// returns. Read and cleared under m.mu by monitor.
+	recycling bool
+
+	// Lifetime count of memory-driven recycles, carried across restarts the
+	// same way restarts is.
+	memoryRecycles int
 }
 
 // Manager handles process lifecycle operations.
@@ -168,13 +183,16 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 
 	// Stop existing instance if running, carry forward restart count
 	previousRestarts := 0
+	previousRecycles := 0
 	if existing, ok := m.processes[key]; ok {
 		if existing.status == StatusStopped || existing.status == StatusErrored {
 			// Dead process - clean start, reset counter, remove stale entry
 			previousRestarts = 0
+			previousRecycles = 0
 			m.store.DeleteProcess(key)
 		} else {
 			previousRestarts = existing.restarts
+			previousRecycles = existing.memoryRecycles
 		}
 		// existing is normally already dead here (monitor restart path), so the
 		// kill/wait returns immediately; signalStop closes its stopCh first.
@@ -244,15 +262,16 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 	}
 
 	proc := &managed{
-		config:    cfg,
-		cmd:       cmd,
-		pid:       cmd.Process.Pid,
-		port:      port,
-		instance:  instance,
-		status:    StatusStarting,
-		startedAt: time.Now(),
-		restarts:  previousRestarts,
-		stopCh:    make(chan struct{}),
+		config:         cfg,
+		cmd:            cmd,
+		pid:            cmd.Process.Pid,
+		port:           port,
+		instance:       instance,
+		status:         StatusStarting,
+		startedAt:      time.Now(),
+		restarts:       previousRestarts,
+		memoryRecycles: previousRecycles,
+		stopCh:         make(chan struct{}),
 	}
 
 	m.processes[key] = proc
@@ -650,16 +669,17 @@ func (m *Manager) List() []Info {
 	var infos []Info
 	for _, proc := range m.processes {
 		info := Info{
-			Name:         instanceKey(proc.config.Name, proc.instance, proc.config.Instances),
-			PID:          proc.pid,
-			Status:       proc.status,
-			Port:         proc.port,
-			Type:         proc.config.Type,
-			Memory:       getProcessMemory(proc.pid),
-			RestartCount: proc.restarts,
-			StartedAt:    proc.startedAt,
-			Command:      proc.config.Command,
-			CWD:          proc.config.CWD,
+			Name:           instanceKey(proc.config.Name, proc.instance, proc.config.Instances),
+			PID:            proc.pid,
+			Status:         proc.status,
+			Port:           proc.port,
+			Type:           proc.config.Type,
+			Memory:         getProcessMemory(proc.pid),
+			RestartCount:   proc.restarts,
+			MemoryRecycles: proc.memoryRecycles,
+			StartedAt:      proc.startedAt,
+			Command:        proc.config.Command,
+			CWD:            proc.config.CWD,
 		}
 		if proc.status == StatusOnline {
 			info.Uptime = time.Since(proc.startedAt)
@@ -678,17 +698,18 @@ func (m *Manager) GetInfo(name string) ([]Info, error) {
 	for _, proc := range m.processes {
 		if proc.config.Name == name {
 			info := Info{
-				Name:         instanceKey(proc.config.Name, proc.instance, proc.config.Instances),
-				PID:          proc.pid,
-				Status:       proc.status,
-				Port:         proc.port,
-				Type:         proc.config.Type,
-				Memory:       getProcessMemory(proc.pid),
-				RestartCount: proc.restarts,
-				StartedAt:    proc.startedAt,
-				Command:      proc.config.Command,
-				CWD:          proc.config.CWD,
-				Env:          proc.config.Env,
+				Name:           instanceKey(proc.config.Name, proc.instance, proc.config.Instances),
+				PID:            proc.pid,
+				Status:         proc.status,
+				Port:           proc.port,
+				Type:           proc.config.Type,
+				Memory:         getProcessMemory(proc.pid),
+				RestartCount:   proc.restarts,
+				MemoryRecycles: proc.memoryRecycles,
+				StartedAt:      proc.startedAt,
+				Command:        proc.config.Command,
+				CWD:            proc.config.CWD,
+				Env:            proc.config.Env,
 			}
 			if proc.status == StatusOnline {
 				info.Uptime = time.Since(proc.startedAt)
@@ -897,6 +918,16 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 
 	m.mu.Lock()
 
+	// A memory recycle is a replacement we asked for, not a failure the process
+	// had. Treating the two the same is what kept single-instance sites down:
+	// the crash backoff reaches 30s past ten restarts, and the process was
+	// serving nothing for all of it, while the crash budget counted down to a
+	// maxRestarts that stopped the application permanently. An application that
+	// simply needs more memory than its ceiling would eventually just stay
+	// dead, with the last thing in the log being a restart that worked.
+	recycle := proc.recycling
+	proc.recycling = false
+
 	// Check restart policy
 	shouldRestart := false
 	switch proc.config.RestartPolicy {
@@ -910,20 +941,25 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 		shouldRestart = false
 	}
 
-	// Fast crash detection: if process lived less than 10s, lower tolerance
-	uptime := time.Since(proc.startedAt)
-	fastCrashLimit := 5
-	if uptime < 10*time.Second && proc.restarts >= fastCrashLimit {
-		shouldRestart = false
-	}
+	// The crash guards below are deliberately skipped for a recycle, but the
+	// restart policy above is not: "never" still means never, however the
+	// process came to exit.
+	if !recycle {
+		// Fast crash detection: if process lived less than 10s, lower tolerance
+		uptime := time.Since(proc.startedAt)
+		fastCrashLimit := 5
+		if uptime < 10*time.Second && proc.restarts >= fastCrashLimit {
+			shouldRestart = false
+		}
 
-	// Check max restarts - default limit 50 if not configured
-	maxRestarts := proc.config.MaxRestarts
-	if maxRestarts <= 0 {
-		maxRestarts = 50 // Safety net: never restart infinitely
-	}
-	if proc.restarts >= maxRestarts {
-		shouldRestart = false
+		// Check max restarts - default limit 50 if not configured
+		maxRestarts := proc.config.MaxRestarts
+		if maxRestarts <= 0 {
+			maxRestarts = 50 // Safety net: never restart infinitely
+		}
+		if proc.restarts >= maxRestarts {
+			shouldRestart = false
+		}
 	}
 
 	if !shouldRestart {
@@ -934,9 +970,19 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 		return
 	}
 
-	// Restart with exponential backoff
-	proc.restarts++
-	delay := restartBackoff(proc.restarts)
+	var delay time.Duration
+	if recycle {
+		// No backoff: the replacement is wanted immediately, and every
+		// millisecond here is a millisecond of 502s for a single-instance app.
+		// Recycles cannot run away — monitorMemory will not fire again until
+		// the new process has cleared its warm-up window.
+		proc.memoryRecycles++
+		delay = recycleSettleDelay
+	} else {
+		// Restart with exponential backoff
+		proc.restarts++
+		delay = restartBackoff(proc.restarts)
+	}
 	proc.status = StatusStarting
 	m.persistProcess(proc, key)
 	m.mu.Unlock()
@@ -1245,9 +1291,16 @@ func (m *Manager) monitorMemory(proc *managed, key string, limit uint64) {
 				return
 			default:
 			}
-			m.mu.RLock()
+			// Mark the kill as planned before it happens. The monitor
+			// goroutine reads this the moment Wait() returns, so setting it
+			// afterwards would race and the recycle would be charged to the
+			// crash budget. Full lock, not RLock: this writes to proc.
+			m.mu.Lock()
 			tracked = m.memInstanceManaged(proc)
-			m.mu.RUnlock()
+			if tracked {
+				proc.recycling = true
+			}
+			m.mu.Unlock()
 			if !tracked {
 				return
 			}
@@ -1283,6 +1336,12 @@ func getProcessMemory(pid int) uint64 {
 }
 
 // restartBackoff calculates delay based on restart count with exponential backoff.
+// How long to wait between a memory recycle's kill and its replacement.
+// stopProcess already waits for the process to exit and reaps whatever still
+// holds the port, so this is only a settling margin for the kernel to release
+// the listening socket — not a backoff. Anything longer is downtime.
+const recycleSettleDelay = 250 * time.Millisecond
+
 func restartBackoff(restarts int) time.Duration {
 	switch {
 	case restarts <= 1:
