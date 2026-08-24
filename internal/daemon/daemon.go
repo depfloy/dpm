@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/depfloy/dpm/internal/api"
 	"github.com/depfloy/dpm/internal/health"
@@ -80,12 +81,46 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 	})
 
 	pm.OnMemoryLimit(func(name string, rss, limit uint64) {
-		logger.Warn("memory limit exceeded, restarting",
+		logger.Warn("memory limit exceeded, replacing",
 			"name", name,
 			"rss_bytes", rss,
 			"limit_bytes", limit,
 		)
 	})
+
+	pm.OnRecycle(func(name, event, detail string) {
+		// "aborted" is the one worth waking up for: a replacement that would not
+		// come up means the application is still serving on a process that is
+		// over its ceiling, and it will keep trying.
+		if event == "aborted" || event == "unavailable" {
+			logger.Warn("recycle handover "+event, "name", name, "detail", detail)
+			return
+		}
+		logger.Info("recycle handover "+event, "name", name, "detail", detail)
+	})
+
+	// The zero-downtime handover needs the shim present: a replacement can only
+	// bind a port its predecessor still holds when both sockets set SO_REUSEPORT.
+	// Missing file means fall back to the in-place restart rather than fail to
+	// start, so a partial install degrades instead of taking the box down.
+	if shim := cfg.Recycle.ReusePortShim; shim != "" {
+		if _, err := os.Stat(shim); err != nil {
+			logger.Warn("reuseport shim not found; memory recycles will restart in place",
+				"path", shim, "error", err)
+		} else {
+			pm.SetReusePortShim(shim)
+			logger.Info("zero-downtime memory recycle enabled", "shim", shim)
+		}
+	} else {
+		logger.Info("zero-downtime memory recycle disabled by config")
+	}
+
+	if d, err := time.ParseDuration(cfg.Recycle.HealthTimeout); err == nil && d > 0 {
+		pm.SetRecycleHealthTimeout(d)
+	}
+	if d, err := time.ParseDuration(cfg.Recycle.Settle); err == nil && d > 0 {
+		pm.SetRecycleSettle(d)
+	}
 
 	d := &Daemon{
 		config:         cfg,
@@ -175,6 +210,18 @@ func (d *Daemon) adoptOrphans() error {
 	}
 	toRestart := make(map[string]*restartInfo) // key: base process name
 
+	// Base names that already have a live process attached. A drifted server
+	// carries two records for one application — the live one under its deploy
+	// key, a dead one under the real key, both naming the same port. Restarting
+	// the dead record there would put a second process on a port that is already
+	// being served, so a base name adopted alive is never also restarted.
+	adoptedNames := make(map[string]bool)
+	for _, ps := range processes {
+		if ps.PID > 0 && processAlive(ps.PID) {
+			adoptedNames[baseProcessName(ps.Name)] = true
+		}
+	}
+
 	for _, ps := range processes {
 		// Clean up processes that exceeded max restarts or are in error state
 		if ps.RestartCount >= 50 || ps.Status == "errored" || ps.Status == "stopped" {
@@ -222,14 +269,25 @@ func (d *Daemon) adoptOrphans() error {
 		} else {
 			// Process is dead - collect for restart from saved config
 			d.store.DeleteProcess(ps.Name)
-			if ps.Port > 0 {
-				d.portManager.ReleasePort(ps.Port)
-			}
 
 			// Extract base name from instance key (e.g., "app_243:0" → "app_243")
-			baseName := ps.Name
-			if idx := strings.Index(ps.Name, ":"); idx > 0 {
-				baseName = ps.Name[:idx]
+			baseName := baseProcessName(ps.Name)
+
+			// Something for this application is already running and has just been
+			// adopted; this record is its stranded twin, naming that live
+			// process's port. Drop the record but leave the port alone — it is in
+			// use, and releasing it would offer a served port to the next
+			// allocation.
+			if adoptedNames[baseName] {
+				d.logger.Info("dropped stale record for a process that is already running",
+					"name", ps.Name,
+					"port", ps.Port,
+				)
+				continue
+			}
+
+			if ps.Port > 0 {
+				d.portManager.ReleasePort(ps.Port)
 			}
 
 			// Collect config once per base name, but accumulate every instance's port.
@@ -380,4 +438,13 @@ func processAlive(pid int) bool {
 		return false
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// baseProcessName strips the instance/deploy suffix from a state key:
+// "app_243:0" and "app_243:deploy:0" both belong to "app_243".
+func baseProcessName(name string) string {
+	if idx := strings.Index(name, ":"); idx > 0 {
+		return name[:idx]
+	}
+	return name
 }

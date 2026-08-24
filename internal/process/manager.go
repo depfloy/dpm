@@ -61,10 +61,39 @@ type managed struct {
 	restarts  int
 	stopCh    chan struct{}
 
+	// The key this process is registered under in m.processes, and the single
+	// source of truth for it. It used to be a parameter captured by value into
+	// the monitor goroutines, which meant a blue-green promotion — a map move
+	// from "app:deploy:0" to "app" — could not reach them: they went on naming
+	// the old key for the rest of the process's life, and the first memory
+	// recycle re-registered the live process back under it while stranding the
+	// promoted entry, dead, under the real one. Every monitor now reads this
+	// field instead. Written only under m.mu.
+	key string
+
 	// Set by monitorMemory immediately before it kills the process, so the
 	// monitor goroutine can tell a planned recycle from a crash when Wait()
 	// returns. Read and cleared under m.mu by monitor.
 	recycling bool
+
+	// True while this process is a replacement that has been started but not yet
+	// promoted. Its own memory watchdog must leave it alone for that window: it
+	// inherits a ceiling it may already exceed, and letting it recycle itself
+	// mid-handover means the replacement kills itself while the process it was
+	// meant to relieve is still waiting to be stopped. Written under m.mu.
+	pendingHandover bool
+
+	// Whether this process was started with the SO_REUSEPORT shim, and can
+	// therefore be handed over rather than replaced in place.
+	//
+	// This is not the same question as "is a shim configured now". Upgrading the
+	// daemon does not restart the processes it adopts, so a box that has just
+	// been upgraded is full of processes that bound their port without
+	// SO_REUSEPORT. Nothing can bind beside those, and attempting it anyway would
+	// abort every time — which, because an aborted handover deliberately does not
+	// fall back, would leave them growing forever until the kernel picked a
+	// victim. They keep being recycled the old way until their next deployment.
+	hasReusePort bool
 
 	// Lifetime count of memory-driven recycles, carried across restarts the
 	// same way restarts is.
@@ -92,6 +121,25 @@ type Manager struct {
 	memFloor      uint64
 	readMemory    func(pid int) uint64
 	onMemoryLimit func(name string, rss, limit uint64)
+
+	// Path to the SO_REUSEPORT shim, injected into Node processes via
+	// NODE_OPTIONS so a replacement can bind the port its predecessor is still
+	// serving. Empty disables the handover and every recycle falls back to the
+	// in-place restart, which is the pre-existing behaviour.
+	reusePortShim string
+
+	// One handover at a time for the whole server. A handover means two copies
+	// of an application are resident at once; letting several run together
+	// multiplies that against the same RAM, and the kernel OOM killer does not
+	// pick the process that caused the problem.
+	recycleSlot chan struct{}
+
+	// How long a replacement gets to come up before the handover is abandoned
+	// and the old process is left serving, and how long it must stay up after
+	// that before the old one is stopped.
+	recycleHealthTimeout time.Duration
+	recycleSettle        time.Duration
+	onRecycle            func(name string, event string, detail string)
 }
 
 // NewManager creates a new process manager.
@@ -113,6 +161,42 @@ func NewManager(store *state.Store, logDir string, rotation config.RotationConfi
 		memBreaches: 3,
 		memFloor:    32 * 1024 * 1024, // ignore any limit below 32MB (likely a mistake)
 		readMemory:  getProcessMemory,
+
+		recycleSlot:          make(chan struct{}, 1),
+		recycleHealthTimeout: 30 * time.Second,
+		recycleSettle:        2 * time.Second,
+	}
+}
+
+// SetReusePortShim enables the zero-downtime memory recycle by pointing at the
+// NODE_OPTIONS shim that makes Node listeners set SO_REUSEPORT. With no shim a
+// replacement cannot bind a port its predecessor still holds, so recycles stay
+// on the in-place path.
+func (m *Manager) SetReusePortShim(path string) {
+	m.reusePortShim = path
+}
+
+// OnRecycle registers an observability hook for the handover. Set once at
+// startup, before any process starts, so it can be read lock-free.
+func (m *Manager) OnRecycle(fn func(name, event, detail string)) {
+	m.onRecycle = fn
+}
+
+// SetRecycleHealthTimeout bounds how long a replacement gets to come up before
+// the handover is abandoned and the old process is left serving.
+func (m *Manager) SetRecycleHealthTimeout(d time.Duration) {
+	m.recycleHealthTimeout = d
+}
+
+// SetRecycleSettle sets how long a replacement must hold after coming online
+// before the process it replaces is stopped.
+func (m *Manager) SetRecycleSettle(d time.Duration) {
+	m.recycleSettle = d
+}
+
+func (m *Manager) notifyRecycle(name, event, detail string) {
+	if m.onRecycle != nil {
+		m.onRecycle(name, event, detail)
 	}
 }
 
@@ -150,6 +234,13 @@ func (m *Manager) Start(cfg *config.ProcessConfig, ports []int) error {
 	m.mu.Lock()
 	for key, proc := range m.processes {
 		if proc.config.Name == cfg.Name {
+			// Signal stop intent before the kill. Without it the monitor (or
+			// monitorAdopted) goroutine sees the process die with stopCh still
+			// open and starts it again from its saved config — so replacing a
+			// process left two of them on one port. That is what a daemon upgrade
+			// did to a drifted server: the old instance was resurrected onto the
+			// same port the freshly started one had just taken.
+			m.signalStop(proc)
 			stopping = append(stopping, toStop{key, proc})
 			delete(m.processes, key)
 			m.store.DeleteProcess(key)
@@ -212,6 +303,13 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 		env = append(env, fmt.Sprintf("%s=%d", portEnv, port))
 	}
 
+	// Make this listener shareable so its eventual replacement can bind the same
+	// port while it is still serving. This has to be set from the very first
+	// start: SO_REUSEPORT only works when every socket on the port sets it, so a
+	// process started without the shim can never be handed over, only restarted
+	// in place.
+	env, reusePortEnabled := withReusePortShim(env, cfg, m.reusePortShim)
+
 	// Drop to the configured user, if there is one. Resolved before the process
 	// is built so an unknown user fails here rather than starting something as
 	// root and reporting success.
@@ -272,6 +370,8 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 		restarts:       previousRestarts,
 		memoryRecycles: previousRecycles,
 		stopCh:         make(chan struct{}),
+		key:            key,
+		hasReusePort:   reusePortEnabled,
 	}
 
 	m.processes[key] = proc
@@ -279,12 +379,13 @@ func (m *Manager) startInstance(cfg *config.ProcessConfig, key string, instance,
 	// Persist state
 	m.persistProcess(proc, key)
 
-	// Monitor process in background
-	go m.monitor(proc, key, logFile, errFile)
+	// Monitor process in background. Neither monitor takes the key: they read
+	// proc.key so a promotion reaches them.
+	go m.monitor(proc, logFile, errFile)
 
 	// Enforce max_memory if a real limit is configured.
 	if limit := parseMemoryLimit(cfg, m.memFloor); limit > 0 {
-		go m.monitorMemory(proc, key, limit)
+		go m.monitorMemory(proc, limit)
 	}
 
 	return nil
@@ -327,6 +428,50 @@ type DeployResult struct {
 	Message  string `json:"message,omitempty"`
 }
 
+// reclaimDeployKeys moves any process of this name that is registered under one
+// of the deploy keys the next Deploy will claim back onto its final key.
+//
+// This is the repair path for state the promotion bug already created. A process
+// stranded on "app:deploy:0" is adopted under that same key when the daemon
+// restarts, so upgrading the binary does not heal it — and the next deploy would
+// hand that key to startInstance, whose prologue stops whatever it finds there.
+// The process it would find is the one serving the site.
+//
+// A dead twin sitting on the final key is dropped; a live one is left alone and
+// handled as an ordinary old worker, because two live processes for one name is a
+// question about ports, and this is not the place to answer it.
+func (m *Manager) reclaimDeployKeys(name string, workerCount int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i := 0; i < workerCount; i++ {
+		deployKey := fmt.Sprintf("%s:deploy:%d", name, i)
+		proc, ok := m.processes[deployKey]
+		if !ok || proc.config == nil || proc.config.Name != name {
+			continue
+		}
+
+		finalKey := instanceKey(name, proc.instance, proc.config.Instances)
+		if finalKey == deployKey {
+			continue
+		}
+
+		if existing, taken := m.processes[finalKey]; taken && existing != proc {
+			if processAlive(existing.pid) {
+				continue
+			}
+			delete(m.processes, finalKey)
+			m.store.DeleteProcess(finalKey)
+		}
+
+		delete(m.processes, deployKey)
+		m.store.DeleteProcess(deployKey)
+		proc.key = finalKey
+		m.processes[finalKey] = proc
+		m.persistProcess(proc, finalKey)
+	}
+}
+
 // Deploy performs a blue-green deployment: starts new workers on new ports,
 // waits for them to be online, then gracefully shuts down old workers.
 // Old workers continue serving traffic until new workers are confirmed healthy,
@@ -334,13 +479,24 @@ type DeployResult struct {
 func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResult, error) {
 	workerCount := cfg.ResolveWorkerCount()
 
-	// 1. Collect old worker info
+	// 0. Free the deploy keys this call is about to claim. A daemon that was
+	//    upgraded while a process sat on its deploy key — the state the drift bug
+	//    left behind across the fleet — would otherwise have step 2 kill the live
+	//    site as a side effect of "starting the new worker", because
+	//    startInstance stops whatever already holds the key it is given.
+	m.reclaimDeployKeys(cfg.Name, workerCount)
+
+	// 1. Collect the workers this deploy will replace, as POINTERS.
+	//    Keys were used here once, and a key is not a stable identity: step 2
+	//    reuses the deploy keys, so a key collected here could name the brand new
+	//    process by the time step 4 looked it up — which is exactly how a deploy
+	//    came to drain the worker it had just promoted.
 	m.mu.RLock()
-	var oldKeys []string
+	var oldWorkers []*managed
 	var oldPorts []int
-	for key, proc := range m.processes {
+	for _, proc := range m.processes {
 		if proc.config.Name == cfg.Name {
-			oldKeys = append(oldKeys, key)
+			oldWorkers = append(oldWorkers, proc)
 			oldPorts = append(oldPorts, proc.port)
 		}
 	}
@@ -430,41 +586,57 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 		return nil, fmt.Errorf("new workers failed to come online within 30s")
 	}
 
-	// 4. Promote: swap deploy keys to final keys
+	// 4. Promote: move the new workers from their deploy keys to their final keys.
+	//    This runs BEFORE the old workers are unregistered. The old order — collect
+	//    old workers, then promote — read the map by key, and because step 2 reuses
+	//    the deploy keys, a stale deploy key in oldKeys pointed at the process that
+	//    had just been started. The deploy deleted it, promoted nothing, and parked
+	//    the live worker for the drain that follows the nginx switch. That is the
+	//    commerce-v2 outage: no listener on the new port, no entry in the manager,
+	//    and a deployment recorded successful.
 	m.mu.Lock()
-	// Collect old workers for deferred cleanup
-	type oldWorker struct {
-		proc *managed
-		key  string
-	}
-	var oldWorkers []oldWorker
-	for _, oldKey := range oldKeys {
-		if proc, ok := m.processes[oldKey]; ok {
-			oldWorkers = append(oldWorkers, oldWorker{proc: proc, key: oldKey})
-			delete(m.processes, oldKey)
-		}
-	}
-
-	// Move new workers from deploy keys to final keys
+	promoted := make(map[*managed]bool)
 	finalKeys := make(map[string]bool)
 	for i := 0; i < workerCount; i++ {
 		deployKey := fmt.Sprintf("%s:deploy:%d", cfg.Name, i)
 		finalKey := instanceKey(cfg.Name, i, workerCount)
-		if proc, ok := m.processes[deployKey]; ok {
-			delete(m.processes, deployKey)
-			m.store.DeleteProcess(deployKey)
-			m.processes[finalKey] = proc
-			m.persistProcess(proc, finalKey)
-			finalKeys[finalKey] = true
+		proc, ok := m.processes[deployKey]
+		if !ok {
+			continue
 		}
+		delete(m.processes, deployKey)
+		m.store.DeleteProcess(deployKey)
+		proc.key = finalKey
+		m.processes[finalKey] = proc
+		m.persistProcess(proc, finalKey)
+		promoted[proc] = true
+		finalKeys[finalKey] = true
+	}
+
+	// Now unregister the workers this deploy replaces, identified by pointer. A
+	// promoted worker is never one of them, however the keys happen to line up.
+	type oldWorker struct {
+		proc *managed
+		key  string
+	}
+	var retired []oldWorker
+	for _, proc := range oldWorkers {
+		if promoted[proc] {
+			continue
+		}
+		key := proc.key
+		if current, ok := m.processes[key]; ok && current == proc {
+			delete(m.processes, key)
+		}
+		retired = append(retired, oldWorker{proc: proc, key: key})
 	}
 	m.mu.Unlock()
 
 	// 5. Store old workers for explicit drain by caller (Depfloy)
 	// Old workers keep running until Drain() is called after nginx switch
-	if len(oldWorkers) > 0 {
+	if len(retired) > 0 {
 		m.mu.Lock()
-		for _, ow := range oldWorkers {
+		for _, ow := range retired {
 			m.pendingDrain[cfg.Name] = append(m.pendingDrain[cfg.Name], ow.proc)
 			// Do NOT delete a store key that step 4 just re-persisted for a promoted
 			// worker. An old worker and its replacement share the same final key
@@ -489,10 +661,25 @@ func (m *Manager) Deploy(cfg *config.ProcessConfig, newPorts []int) (*DeployResu
 // Called by Depfloy after nginx has been switched to the new port.
 func (m *Manager) Drain(name string) error {
 	m.mu.Lock()
-	workers, ok := m.pendingDrain[name]
+	parked, ok := m.pendingDrain[name]
 	if ok {
 		delete(m.pendingDrain, name)
 	}
+
+	// Never drain a process that is still the managed instance. Depfloy calls
+	// Drain after it has already pointed nginx at the new port, so killing a live
+	// worker here is an outage with no way back — the site stays down until a
+	// human redeploys, and the deployment has already been recorded successful.
+	// Deploy is supposed to park only retired workers; this is the check that
+	// keeps a bug there from reaching production as a dead site.
+	var workers []*managed
+	for _, proc := range parked {
+		if m.memInstanceManaged(proc) {
+			continue
+		}
+		workers = append(workers, proc)
+	}
+
 	// Signal stop intent under the lock so the mutation of proc.status/stopCh does
 	// not race with the parked workers' still-running monitor goroutines.
 	for _, proc := range workers {
@@ -500,7 +687,7 @@ func (m *Manager) Drain(name string) error {
 	}
 	m.mu.Unlock()
 
-	if !ok || len(workers) == 0 {
+	if len(workers) == 0 {
 		return nil
 	}
 
@@ -763,15 +950,16 @@ func (m *Manager) Attach(ps *state.ProcessState) error {
 		stopCh:    make(chan struct{}),
 	}
 
+	proc.key = ps.Name
 	m.processes[ps.Name] = proc
 
 	// Monitor the re-adopted process
-	go m.monitorAdopted(proc, ps.Name)
+	go m.monitorAdopted(proc)
 
 	// Enforce max_memory if a real limit is configured. The warm-up window gives
 	// adopted processes a fresh grace period after a daemon restart.
 	if limit := parseMemoryLimit(&cfg, m.memFloor); limit > 0 {
-		go m.monitorMemory(proc, ps.Name, limit)
+		go m.monitorMemory(proc, limit)
 	}
 
 	return nil
@@ -882,16 +1070,66 @@ func killPortHolder(port int) {
 	}
 }
 
+// withReusePortShim adds the SO_REUSEPORT shim to NODE_OPTIONS for Node
+// processes, preserving anything the customer already put there — their flags
+// are part of how their application boots, and dropping them would be a silent
+// behaviour change that only shows up under load.
+// Reports whether the process will actually carry SO_REUSEPORT, which is what
+// decides if it can later be handed over instead of replaced in place.
+func withReusePortShim(env []string, cfg *config.ProcessConfig, shim string) ([]string, bool) {
+	if shim == "" || !strings.EqualFold(cfg.Type, "nodejs") {
+		return env, false
+	}
+
+	const key = "NODE_OPTIONS="
+	addition := "--require " + shim
+
+	for i, entry := range env {
+		if !strings.HasPrefix(entry, key) {
+			continue
+		}
+		existing := strings.TrimPrefix(entry, key)
+		if strings.Contains(existing, shim) {
+			return env, true // already carries it; a restart must not stack copies
+		}
+		if strings.TrimSpace(existing) == "" {
+			env[i] = key + addition
+		} else {
+			env[i] = key + existing + " " + addition
+		}
+		return env, true
+	}
+
+	return append(env, key+addition), true
+}
+
+// currentKey returns the key this process is registered under. Read it fresh
+// every time rather than caching it across an unlock: a blue-green promotion
+// moves a process from its deploy key to its final key, and a monitor holding
+// the old string would re-register the process under a key nothing serves.
+func (m *Manager) currentKey(proc *managed) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return proc.key
+}
+
 // monitor watches a started process for exit and handles restarts.
-func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer) {
+//
+// The key is deliberately NOT a parameter. It used to be, and a promotion could
+// not reach the running goroutine, which is what stranded promoted workers under
+// their deploy keys and eventually let a deploy drain the process it had just
+// started. proc.key is the only source of truth.
+func (m *Manager) monitor(proc *managed, logFile, errFile io.Closer) {
 	defer logFile.Close()
 	defer errFile.Close()
 
 	// Panic recovery - never crash the daemon
 	defer func() {
 		if r := recover(); r != nil {
+			m.mu.Lock()
 			proc.status = StatusErrored
-			m.persistProcess(proc, key)
+			m.persistProcess(proc, proc.key)
+			m.mu.Unlock()
 		}
 	}()
 
@@ -900,6 +1138,7 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 	if processAlive(proc.pid) {
 		m.mu.Lock()
 		proc.status = StatusOnline
+		key := proc.key
 		m.persistProcess(proc, key)
 		m.mu.Unlock()
 		m.notifyStatusChange(key, StatusOnline)
@@ -964,6 +1203,7 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 
 	if !shouldRestart {
 		proc.status = StatusStopped
+		key := proc.key
 		m.persistProcess(proc, key)
 		m.mu.Unlock()
 		m.notifyStatusChange(key, StatusStopped)
@@ -984,7 +1224,7 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 		delay = restartBackoff(proc.restarts)
 	}
 	proc.status = StatusStarting
-	m.persistProcess(proc, key)
+	m.persistProcess(proc, proc.key)
 	m.mu.Unlock()
 
 	time.Sleep(delay)
@@ -998,6 +1238,9 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 	default:
 	}
 
+	// Read the key after the sleep, not before: a promotion during the delay
+	// must be honoured, or the replacement lands on a key nothing serves.
+	key := m.currentKey(proc)
 	if err := m.startInstance(proc.config, key, proc.instance, proc.port); err != nil {
 		m.mu.Lock()
 		proc.status = StatusErrored
@@ -1009,11 +1252,13 @@ func (m *Manager) monitor(proc *managed, key string, logFile, errFile io.Closer)
 
 // monitorAdopted watches an adopted process (no cmd reference).
 // If the process dies, it restarts from saved config.
-func (m *Manager) monitorAdopted(proc *managed, key string) {
+func (m *Manager) monitorAdopted(proc *managed) {
 	defer func() {
 		if r := recover(); r != nil {
+			m.mu.Lock()
 			proc.status = StatusErrored
-			m.persistProcess(proc, key)
+			m.persistProcess(proc, proc.key)
+			m.mu.Unlock()
 		}
 	}()
 
@@ -1036,6 +1281,7 @@ func (m *Manager) monitorAdopted(proc *managed, key string) {
 
 				// Process died unexpectedly - restart from saved config
 				m.mu.Lock()
+				key := proc.key
 				delete(m.processes, key)
 				m.mu.Unlock()
 
@@ -1236,7 +1482,7 @@ func (m *Manager) memInstanceManaged(proc *managed) bool {
 // deadlocked the daemon before): each tick takes only a brief RLock to snapshot
 // proc.pid and confirm proc is still managed, then releases it before the /proc
 // read and the (blocking) stopProcess call.
-func (m *Manager) monitorMemory(proc *managed, key string, limit uint64) {
+func (m *Manager) monitorMemory(proc *managed, limit uint64) {
 	defer func() { _ = recover() }()
 
 	// Warm-up grace: never enforce during boot / JIT / first-request compile
@@ -1261,10 +1507,18 @@ func (m *Manager) monitorMemory(proc *managed, key string, limit uint64) {
 			m.mu.RLock()
 			tracked := m.memInstanceManaged(proc)
 			pid := proc.pid
+			pending := proc.pendingHandover
 			m.mu.RUnlock()
 
 			if !tracked {
 				return // drained, deleted, or replaced by a redeploy
+			}
+
+			if pending {
+				// A replacement mid-handover. It is not serving on its own terms
+				// yet and must not recycle itself out from under the handover.
+				over = 0
+				continue
 			}
 
 			rss := m.readMemory(pid)
@@ -1280,12 +1534,42 @@ func (m *Manager) monitorMemory(proc *managed, key string, limit uint64) {
 				continue
 			}
 
-			// Sustained breach. Re-check stop intent and management, then restart by
-			// calling stopProcess WITHOUT signalStop: the monitor/monitorAdopted
-			// goroutine sees the process die with stopCh still open and resurrects it
-			// via the normal restart_policy path. So a memory restart counts against
-			// maxRestarts and the fast-crash guard, and an OOM-looping app eventually
-			// stops. We return after one action; monitor owns the actual restart.
+			// Sustained breach.
+			select {
+			case <-proc.stopCh:
+				return
+			default:
+			}
+
+			m.mu.RLock()
+			key := proc.key
+			m.mu.RUnlock()
+			if m.onMemoryLimit != nil {
+				m.onMemoryLimit(key, rss, limit)
+			}
+
+			// Preferred path: bring the replacement up on the same port before
+			// this process goes away, so the port is never unserved.
+			switch m.recycleInstance(proc) {
+			case recycleHandedOver:
+				return
+			case recycleKeptRunning:
+				// A replacement was attempted and this process is still the one
+				// serving — either it could not come up, or another handover had
+				// the slot. Do NOT replace it in place: that would stop a working
+				// process to start one already shown not to boot. Reset the breach
+				// counter so it takes another sustained breach to try again.
+				over = 0
+				continue
+			case recycleUnavailable:
+				// The handover was never attempted, so the in-place restart below
+				// is still the only way to reclaim the memory.
+			}
+
+			// Fall back to replacing in place. Re-check stop intent and
+			// management, then kill WITHOUT signalStop: the monitor goroutine
+			// sees the process die with stopCh still open and starts the
+			// replacement via the restart_policy path.
 			select {
 			case <-proc.stopCh:
 				return
@@ -1305,13 +1589,200 @@ func (m *Manager) monitorMemory(proc *managed, key string, limit uint64) {
 				return
 			}
 
-			if m.onMemoryLimit != nil {
-				m.onMemoryLimit(key, rss, limit)
-			}
 			m.stopProcess(proc)
 			return
 		}
 	}
+}
+
+// recycleInstance replaces a process that has outgrown its memory ceiling
+// without ever leaving its port unserved.
+//
+// The old way was to kill the process and start its replacement on the freed
+// port. For a single-instance application behind nginx that is an outage for the
+// whole boot: with one server in the upstream, nginx's proxy_next_upstream retry
+// has nowhere to go and answers 502. Measured at 200 rps in
+// depfloy-app/docker/testbed/reuseport, that is ~52 lost requests per recycle
+// against a lab app that boots in 2ms — a real storefront boots in seconds, and
+// app_244 recycled 196 times.
+//
+// Here the replacement binds the same port alongside the process still serving
+// it (SO_REUSEPORT, via the NODE_OPTIONS shim), and only once it is up is the
+// old one stopped. nginx is never reconfigured and no port is reallocated,
+// because the port never changes. Requests that hit the old process as it goes
+// away fail retryably — recv() failed, upstream prematurely closed — and the
+// retry lands on the replacement already listening there. The same measurements
+// show zero lost requests, including when the application ignores SIGTERM and
+// has to be killed.
+//
+// The three outcomes are deliberately distinct. "Unavailable" means the handover
+// was never attempted, so the caller may still replace the process in place.
+// "Kept running" means a replacement was started and would not come up — falling
+// back there would kill a serving process in order to start one already proven
+// unable to boot, which is how a bad release turns into an outage.
+type recycleOutcome int
+
+const (
+	recycleUnavailable recycleOutcome = iota
+	recycleHandedOver
+	recycleKeptRunning
+)
+
+func (m *Manager) recycleInstance(proc *managed) recycleOutcome {
+	if m.reusePortShim == "" {
+		return recycleUnavailable
+	}
+
+	m.mu.RLock()
+	key := proc.key
+	cfg := proc.config
+	port := proc.port
+	instance := proc.instance
+	managedNow := m.memInstanceManaged(proc)
+	canShare := proc.hasReusePort
+	m.mu.RUnlock()
+
+	if !managedNow || cfg == nil || port <= 0 {
+		return recycleUnavailable
+	}
+
+	// This process bound its port without SO_REUSEPORT — it predates the shim, or
+	// was adopted across a daemon upgrade, which does not restart what it adopts.
+	// Nothing can bind beside it, so the only way to reclaim its memory is the
+	// in-place restart, until its next deployment starts it with the shim.
+	if !canShare {
+		return recycleUnavailable
+	}
+	name := cfg.Name
+
+	// One overlap at a time for the whole server. Anything already handing over
+	// gets to finish; this process stays over its ceiling until the next sample,
+	// which is a far cheaper outcome than two doubled applications at once.
+	select {
+	case m.recycleSlot <- struct{}{}:
+	default:
+		m.notifyRecycle(name, "deferred", "another handover is in progress")
+		// Not "unavailable": the process is fine, it just has to wait its turn.
+		// Replacing it in place now would be an outage taken to avoid a queue.
+		return recycleKeptRunning
+	}
+	defer func() { <-m.recycleSlot }()
+
+	// Re-check under the lock: the wait for the slot is unbounded in principle,
+	// and a redeploy or a stop may have replaced this instance meanwhile.
+	m.mu.RLock()
+	stillManaged := m.memInstanceManaged(proc)
+	m.mu.RUnlock()
+	if !stillManaged {
+		return recycleKeptRunning
+	}
+	select {
+	case <-proc.stopCh:
+		return recycleKeptRunning
+	default:
+	}
+
+	replacementKey := key + ":recycle"
+	m.notifyRecycle(name, "starting", fmt.Sprintf("replacement on port %d", port))
+
+	if err := m.startInstance(cfg, replacementKey, instance, port); err != nil {
+		// The usual cause is a process started before the shim existed, whose
+		// socket does not carry SO_REUSEPORT — so nothing can bind beside it.
+		m.notifyRecycle(name, "unavailable", err.Error())
+		return recycleUnavailable
+	}
+
+	m.mu.Lock()
+	replacement := m.processes[replacementKey]
+	if replacement != nil {
+		// Take the replacement out of the watchdog's reach until it is promoted.
+		// It carries the same ceiling as the process it is relieving and may be
+		// over it from the first sample, and a replacement that recycles itself
+		// mid-handover leaves nobody to promote.
+		replacement.pendingHandover = true
+	}
+	m.mu.Unlock()
+	if replacement == nil {
+		return recycleUnavailable
+	}
+
+	if !m.awaitReplacement(replacement) {
+		// Never trade a running site for a replacement that will not come up.
+		m.notifyRecycle(name, "aborted", "replacement did not come up; keeping the running process")
+		m.mu.Lock()
+		if current, ok := m.processes[replacementKey]; ok && current == replacement {
+			delete(m.processes, replacementKey)
+		}
+		m.store.DeleteProcess(replacementKey)
+		replacement.pendingHandover = false
+		m.signalStop(replacement)
+		m.mu.Unlock()
+		m.stopProcess(replacement)
+		return recycleKeptRunning
+	}
+
+	// The replacement is serving the port. Promote it onto the real key and take
+	// the old process out of the manager in the same critical section, so no
+	// reader ever sees two live instances under one name.
+	m.mu.Lock()
+	delete(m.processes, replacementKey)
+	m.store.DeleteProcess(replacementKey)
+	replacement.key = key
+	replacement.memoryRecycles = proc.memoryRecycles + 1
+	replacement.restarts = proc.restarts
+	replacement.pendingHandover = false
+	m.processes[key] = replacement
+	m.persistProcess(replacement, key)
+	// signalStop before the kill so the old process's monitor treats the exit as
+	// intentional and does not resurrect it onto a key the replacement now owns.
+	m.signalStop(proc)
+	m.mu.Unlock()
+
+	m.stopProcess(proc)
+	m.notifyRecycle(name, "completed", fmt.Sprintf("port %d handed over", port))
+	return recycleHandedOver
+}
+
+// awaitReplacement waits for a freshly started replacement to reach online and
+// hold there. It reports false the moment the process dies, so a release that
+// crashes on boot costs nothing rather than taking the site with it.
+func (m *Manager) awaitReplacement(replacement *managed) bool {
+	deadline := time.Now().Add(m.recycleHealthTimeout)
+	online := false
+
+	for time.Now().Before(deadline) {
+		if !processAlive(replacement.pid) {
+			return false
+		}
+		m.mu.RLock()
+		status := replacement.status
+		tracked := m.memInstanceManaged(replacement)
+		m.mu.RUnlock()
+		if !tracked {
+			return false
+		}
+		if status == StatusOnline {
+			online = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if !online {
+		return false
+	}
+
+	// A process that comes up and immediately falls over must not be promoted;
+	// the old one is still serving and is the safer thing to keep.
+	settleDeadline := time.Now().Add(m.recycleSettle)
+	for time.Now().Before(settleDeadline) {
+		if !processAlive(replacement.pid) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return processAlive(replacement.pid)
 }
 
 // getProcessMemory returns the RSS memory usage in bytes for a PID.

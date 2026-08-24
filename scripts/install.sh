@@ -121,6 +121,61 @@ mkdir -p /etc/dpm
 mkdir -p /var/log/dpm/apps
 mkdir -p /var/lib/dpm
 mkdir -p /var/run/dpm
+mkdir -p "$PREFIX/lib/dpm"
+
+# SO_REUSEPORT shim. Injected into Node processes via NODE_OPTIONS so a
+# replacement can bind the port its predecessor is still serving; without it a
+# memory recycle has to kill the only listener first, which is a 502 for the
+# whole boot. Written on every install so an upgrade repairs a missing copy.
+#
+# The heredoc is quoted: the file contains ${...} template literals.
+echo "==> Installing reuseport shim..."
+cat > "$PREFIX/lib/dpm/reuseport-shim.js" << 'SHIMEOF'
+// Injected with NODE_OPTIONS=--require. Makes every TCP listen() in the process
+// set SO_REUSEPORT, without the application knowing.
+//
+// This exists because the frameworks Depfloy runs — react-router-serve, next
+// start, nuxt's nitro server — call listen(port) themselves and expose no way to
+// pass options through. Patching the one place Node funnels all of them through
+// is less invasive than forking each serve binary.
+const net = require('net');
+
+const original = net.Server.prototype.listen;
+
+net.Server.prototype.listen = function patchedListen(...args) {
+    // listen(options[, callback]) — the shape that already carries options.
+    if (args.length > 0 && typeof args[0] === 'object' && args[0] !== null && !Array.isArray(args[0])) {
+        const opts = args[0];
+        // Only TCP ports. A unix socket path or a file descriptor has no
+        // SO_REUSEPORT, and setting it makes Node throw on those platforms.
+        if (opts.port !== undefined && opts.path === undefined && opts.fd === undefined && opts.reusePort === undefined) {
+            args[0] = { ...opts, reusePort: true };
+        }
+        return original.apply(this, args);
+    }
+
+    // listen(port[, host][, backlog][, callback]) — the shape frameworks use.
+    // Rebuild it as an options object so reusePort can ride along, preserving
+    // whatever positional arguments were actually supplied.
+    if (args.length > 0 && (typeof args[0] === 'number' || (typeof args[0] === 'string' && /^\d+$/.test(args[0])))) {
+        const opts = { port: Number(args[0]), reusePort: true };
+        const rest = [];
+        for (const arg of args.slice(1)) {
+            if (typeof arg === 'string') opts.host = arg;
+            else if (typeof arg === 'number') opts.backlog = arg;
+            else if (typeof arg === 'function') rest.push(arg);
+        }
+        return original.call(this, opts, ...rest);
+    }
+
+    return original.apply(this, args);
+};
+
+if (process.env.REUSEPORT_SHIM_VERBOSE === '1') {
+    console.log(`EVENT shim_loaded pid=${process.pid}`);
+}
+SHIMEOF
+chmod 0644 "$PREFIX/lib/dpm/reuseport-shim.js"
 
 # Create default config if not exists
 if [ ! -f /etc/dpm/config.yaml ]; then
@@ -159,6 +214,14 @@ health_check:
 
 state:
   dir: /var/lib/dpm
+
+# Replacing a process that outgrew its memory ceiling. The shim lets the
+# replacement bind the port its predecessor is still serving, so nothing is ever
+# unserved; clear reuseport_shim to fall back to the in-place restart.
+recycle:
+  reuseport_shim: /usr/local/lib/dpm/reuseport-shim.js
+  health_timeout: 30s
+  settle: 2s
 YAML
 fi
 

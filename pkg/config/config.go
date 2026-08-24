@@ -27,6 +27,30 @@ type DaemonConfig struct {
 	State struct {
 		Dir string `yaml:"dir"`
 	} `yaml:"state"`
+
+	Recycle RecycleConfig `yaml:"recycle"`
+}
+
+// RecycleConfig controls how a process that has outgrown its memory ceiling is
+// replaced.
+//
+// Without a shim path the replacement cannot bind the port its predecessor is
+// still serving, so the recycle falls back to killing the process and starting
+// the replacement on the freed port — which for a single-instance application
+// behind nginx is a 502 for the whole boot.
+type RecycleConfig struct {
+	// Path to the NODE_OPTIONS shim that makes Node listeners set SO_REUSEPORT.
+	// Empty disables the zero-downtime handover. Set it to "" to roll back
+	// without downgrading the binary.
+	ReusePortShim string `yaml:"reuseport_shim"`
+
+	// How long a replacement gets to come up before the handover is abandoned
+	// and the old process is left serving.
+	HealthTimeout string `yaml:"health_timeout"`
+
+	// How long the replacement must stay up after coming online before the old
+	// process is stopped.
+	Settle string `yaml:"settle"`
 }
 
 // LoggingConfig defines log rotation and format settings.
@@ -159,6 +183,9 @@ func DefaultDaemonConfig() *DaemonConfig {
 	cfg.HealthCheck.Timeout = "5s"
 	cfg.HealthCheck.Retries = 3
 	cfg.State.Dir = "/var/lib/dpm"
+	cfg.Recycle.ReusePortShim = "/usr/local/lib/dpm/reuseport-shim.js"
+	cfg.Recycle.HealthTimeout = "30s"
+	cfg.Recycle.Settle = "2s"
 	return cfg
 }
 
