@@ -290,9 +290,16 @@ func (d *Daemon) adoptOrphans() error {
 				d.portManager.ReleasePort(ps.Port)
 			}
 
-			// Collect config once per base name, but accumulate every instance's port.
+			// Collect config once per base name, but accumulate every instance's
+			// port. Ports are deduplicated: a real multi-worker process has one
+			// record per worker, each on its OWN port ("app:0" on 3004, "app:1"
+			// on 3005). Two records naming the SAME port are not two workers —
+			// they are one process recorded twice, which is what the promotion
+			// drift left behind. Without this, Start derives its worker count
+			// from len(ports) and launches a second instance onto a port the
+			// first one is already using.
 			if existing, exists := toRestart[baseName]; exists {
-				if ps.Port > 0 {
+				if ps.Port > 0 && !containsPort(existing.ports, ps.Port) {
 					existing.ports = append(existing.ports, ps.Port)
 				}
 			} else {
@@ -447,4 +454,14 @@ func baseProcessName(name string) string {
 		return name[:idx]
 	}
 	return name
+}
+
+// containsPort reports whether ports already holds p.
+func containsPort(ports []int, p int) bool {
+	for _, existing := range ports {
+		if existing == p {
+			return true
+		}
+	}
+	return false
 }

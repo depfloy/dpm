@@ -715,7 +715,18 @@ func (m *Manager) ReloadAll() (int, int, error) {
 		if _, ok := saved[name]; !ok {
 			saved[name] = &savedProcess{cfg: proc.config}
 		}
-		saved[name].ports = append(saved[name].ports, proc.port)
+		// Deduplicate ports. Start below derives its worker count from
+		// len(ports), so a name that appears twice on the SAME port — one
+		// application recorded twice, which is what promotion drift leaves —
+		// would come back as two instances fighting over one port. A genuine
+		// multi-worker process has a distinct port per worker and is unaffected.
+		//
+		// This is the path Depfloy's own upgrade takes: DpmUpgradeService runs
+		// `dpm reload` after installing the binary, so the fault landed on a
+		// customer box before this guard existed.
+		if !containsPortValue(saved[name].ports, proc.port) {
+			saved[name].ports = append(saved[name].ports, proc.port)
+		}
 	}
 	m.mu.RUnlock()
 
@@ -2170,6 +2181,16 @@ func isContinuationLine(line string) bool {
 		strings.HasPrefix(trimmed, "syscall:") || strings.HasPrefix(trimmed, "address:") ||
 		strings.HasPrefix(trimmed, "port:") {
 		return true
+	}
+	return false
+}
+
+// containsPortValue reports whether ports already holds p.
+func containsPortValue(ports []int, p int) bool {
+	for _, existing := range ports {
+		if existing == p {
+			return true
+		}
 	}
 	return false
 }

@@ -294,3 +294,72 @@ func TestDrainRefusesToKillTheManagedInstance(t *testing.T) {
 		t.Errorf("status after drain = %q, want online", got)
 	}
 }
+
+// ==================== Reload does not split one process into two ====================
+
+// This is the path Depfloy's own upgrade takes: DpmUpgradeService runs
+// `dpm reload` after installing the binary, which is ReloadAll — every process
+// killed and restarted from its saved config.
+//
+// On depfloy-v1 that turned a drifted project into two live processes sharing
+// one port, each with its own RSS, both reported under the bare application
+// name. ReloadAll collected ports per name without deduplicating, Start derives
+// its worker count from len(ports), and the SO_REUSEPORT shim meant the second
+// instance bound successfully instead of failing loudly with EADDRINUSE.
+//
+// Two entries on one port are one application recorded twice. A real
+// multi-worker process has a distinct port per worker.
+func TestReloadAllDoesNotDuplicateAProcessSharingAPort(t *testing.T) {
+	mgr, _ := testManager(t)
+
+	cfg := testConfig("reload-app", "sleep 300")
+	if err := mgr.Start(cfg, []int{9701}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := waitForStatus(mgr, "reload-app", StatusOnline, 15*time.Second); got != StatusOnline {
+		t.Fatalf("status = %q, want online", got)
+	}
+	t.Cleanup(func() { _ = mgr.Stop("reload-app") })
+
+	// The drifted shape: the same live process registered under two keys, as a
+	// promotion followed by a memory recycle used to leave it.
+	mgr.mu.Lock()
+	live := mgr.processes["reload-app"]
+	if live == nil {
+		mgr.mu.Unlock()
+		t.Fatal("no process under the final key after Start")
+	}
+	twin := &managed{
+		config:    live.config,
+		cmd:       live.cmd,
+		pid:       live.pid,
+		port:      live.port, // the same port: that is what makes it a duplicate
+		instance:  0,
+		status:    StatusOnline,
+		startedAt: live.startedAt,
+		stopCh:    make(chan struct{}),
+		key:       "reload-app:deploy:0",
+	}
+	mgr.processes["reload-app:deploy:0"] = twin
+	mgr.mu.Unlock()
+
+	if _, _, err := mgr.ReloadAll(); err != nil {
+		t.Fatalf("ReloadAll: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	count := 0
+	ports := map[int]int{}
+	for _, info := range mgr.List() {
+		if info.Command == "sleep 300" {
+			count++
+			ports[info.Port]++
+		}
+	}
+	if count != 1 {
+		t.Errorf("instances after reload = %d, want 1 — two records on one port are one process", count)
+	}
+	if ports[9701] > 1 {
+		t.Errorf("%d instances share port 9701; that is the depfloy-v1 fault", ports[9701])
+	}
+}

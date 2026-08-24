@@ -561,3 +561,77 @@ func TestAdoptOrphansPreservesRestartCount(t *testing.T) {
 	}
 	t.Error("adopted process not found in list")
 }
+
+// ==================== A drifted pair is one process, not two workers ====================
+
+// Reproduces what a fleet upgrade did to depfloy-v1 on 2026-08-24: eleven
+// applications came back, and one of them came back twice — two live processes
+// on port 3004, each with its own RSS, both reported as "app_214" by dpm list.
+//
+// The chain: promotion drift left two BoltDB records for one application, both
+// naming the same port ("app_214" and "app_214:deploy:0"). Every process on the
+// box was dead by the time the new daemon started, so the adopted-alive guard did
+// not apply, and adoptOrphans accumulated ports [3004, 3004] for the base name.
+// Start derives its worker count from len(ports), so it launched two instances —
+// and since Depfloy sends no "instances" for a zero-downtime Node project,
+// instanceKey renders both of them as the bare name, hiding the duplication.
+//
+// Two records naming the same port are one process recorded twice. A genuine
+// multi-worker process has a distinct port per worker, which
+// TestAdoptOrphansRestartsAllWorkerPorts covers and this must not break.
+//
+// Worth stating why it went unnoticed: before the SO_REUSEPORT shim the second
+// instance would have failed to bind and errored out loudly. With the shim it
+// binds happily beside the first, so the fault became silent — twice the memory,
+// traffic split between two processes, forever.
+func TestAdoptOrphansTreatsSamePortRecordsAsOneProcess(t *testing.T) {
+	store, pm, portMgr := testDaemonComponents(t)
+
+	d := &Daemon{
+		store:          store,
+		processManager: pm,
+		portManager:    portMgr,
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	// No "instances" — exactly what DeployProject sends for a zero-downtime
+	// Node project, and what makes the duplicate invisible in dpm list.
+	cfgJSON, _ := json.Marshal(&config.ProcessConfig{
+		Name:          "drifted-app",
+		Command:       "sleep 300",
+		CWD:           "/tmp",
+		Type:          "nodejs",
+		RestartPolicy: "always",
+	})
+
+	const deadPID = 999999999
+	for _, key := range []string{"drifted-app", "drifted-app:deploy:0"} {
+		store.SaveProcess(&state.ProcessState{
+			Name:       key,
+			PID:        deadPID,
+			Port:       13004, // the same port in both records: that is the drift
+			Status:     "online",
+			Command:    "sleep 300",
+			CWD:        "/tmp",
+			Type:       "nodejs",
+			ConfigJSON: cfgJSON,
+		})
+	}
+
+	if err := d.adoptOrphans(); err != nil {
+		t.Fatalf("adoptOrphans: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+	t.Cleanup(func() { pm.Stop("drifted-app") })
+
+	count := 0
+	for _, info := range pm.List() {
+		if info.Command == "sleep 300" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("restarted instance count = %d, want 1 — two records on one port are one process, "+
+			"and starting a second onto a port already in use is the depfloy-v1 fault", count)
+	}
+}
