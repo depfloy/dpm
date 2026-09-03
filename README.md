@@ -97,6 +97,9 @@ my-app    nodejs  online  12345  3000  48.2 MB   2h 15m  0
 | `dpm list` | List all managed processes in a table |
 | `dpm list --json` | List all managed processes as JSON |
 | `dpm info <name>` | Show detailed information about a process |
+| `dpm logs <name> --lines=100` | Show the latest process log lines |
+| `dpm logs <name> --follow --lines=100` | Show a backlog, then follow stdout and stderr |
+| `dpm logs <name> --follow --level=error` | Follow stderr only |
 | `dpm status` | Show daemon status (total/online processes) |
 | `dpm health` | Check health of all processes |
 | `dpm health --json` | Health check output as JSON |
@@ -112,6 +115,19 @@ my-app    nodejs  online  12345  3000  48.2 MB   2h 15m  0
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DPM_SOCKET` | `/var/run/dpm/dpm.sock` | Unix socket path for CLI-to-daemon communication |
+
+### Live log follow contract
+
+DPM 1.13.0 introduces the reliable follow contract consumed by Depfloy live
+application logs. `dpm logs <name> --follow --lines=N` writes the latest N
+complete lines in chronological order, followed by each new complete line once.
+The combined stream discovers `current.log`, `error.log`, and any numeric
+`instance-*.log` / `instance-*.error.log` files while it is running.
+
+Rename-based rotation, truncate-and-regrow, and instance replacement do not end
+the stream. Disconnecting the client cancels the follower and closes every open
+log file. Follow output is line-oriented plain text; `--json` remains the finite
+snapshot format.
 
 ## Configuration
 

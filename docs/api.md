@@ -459,6 +459,30 @@ Manually allocate ports from the appropriate range. Ports are verified to be fre
 
 ---
 
+## Log Endpoints
+
+### Read or Follow Process Logs
+
+```
+GET /api/v1/logs/{name}?lines=100&level=error&follow=true
+```
+
+Without `follow=true`, the endpoint returns a finite snapshot. `format=json`
+returns the standard response envelope with parsed entries; otherwise the body
+is plain text.
+
+With `follow=true`, the response is line-oriented `text/plain`. It starts with
+the latest `lines` complete records in chronological order, then streams new
+stdout and stderr records exactly once. `level=error` limits both the backlog
+and live stream to stderr files. The follower re-discovers numeric instance log
+files and continues across rename rotation, truncation, and instance file
+replacement. Closing the HTTP request cancels the follower and releases its
+file handles.
+
+Reliable follow semantics require DPM 1.13.0 or newer.
+
+---
+
 ## System Endpoints
 
 ### Daemon Status

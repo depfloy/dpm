@@ -355,9 +355,12 @@ func cmdLogs(args []string) {
 		}
 		defer resp.Body.Close()
 		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		scanner.Buffer(make([]byte, 256*1024), 1024*1024)
 		for scanner.Scan() {
 			fmt.Println(scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			fatal("Log stream interrupted: %v", err)
 		}
 		return
 	}
@@ -710,6 +713,7 @@ Commands:
   delete <name>             Stop and remove a process
   list                      List all processes
   info <name>               Show process details
+  logs <name> [-f]          Show or follow process logs
   status                    Show daemon status
   health [--json]           Check health of all processes
   port list                 List port allocations

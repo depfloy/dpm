@@ -2,7 +2,9 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -406,6 +408,28 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 
 	// Read log files
 	logDir := filepath.Join(r.config.Logging.Dir, "apps", name)
+	if follow {
+		w.Header().Set("Content-Type", "text/plain")
+		flusher, _ := w.(http.Flusher)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		follower := dpmlog.NewFollower(logDir, level, 0)
+		err := follower.Follow(req.Context(), lines, func(line string) error {
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				return err
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return nil
+		})
+		if err != nil && !errors.Is(err, context.Canceled) && r.logger != nil {
+			r.logger.Warn("log follower stopped", "name", name, "error", err)
+		}
+		return
+	}
+
 	var allLines []string
 
 	// Read main log + instance logs
@@ -483,80 +507,6 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 			fmt.Fprintln(w, line)
 		}
 
-		// Follow mode: stream new lines
-		if follow {
-			flusher, ok := w.(http.Flusher)
-			if ok {
-				flusher.Flush()
-			}
-
-			// Track file sizes
-			logDir := filepath.Join(r.config.Logging.Dir, "apps", name)
-			positions := make(map[string]int64)
-			allFiles := []string{"current.log", "instance-1.log", "instance-2.log", "instance-3.log",
-				"error.log", "instance-1.error.log", "instance-2.error.log", "instance-3.error.log"}
-			if level == "error" {
-				allFiles = []string{"error.log", "instance-1.error.log", "instance-2.error.log", "instance-3.error.log"}
-			}
-			for _, f := range allFiles {
-				p := filepath.Join(logDir, f)
-				if info, err := os.Stat(p); err == nil {
-					positions[p] = info.Size()
-				}
-			}
-
-			ticker := time.NewTicker(500 * time.Millisecond)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-req.Context().Done():
-					return
-				case <-ticker.C:
-					for _, f := range allFiles {
-						p := filepath.Join(logDir, f)
-						info, err := os.Stat(p)
-						if err != nil {
-							continue
-						}
-						pos := positions[p]
-						if info.Size() <= pos {
-							continue
-						}
-						file, err := os.Open(p)
-						if err != nil {
-							continue
-						}
-						file.Seek(pos, 0)
-						scanner := bufio.NewScanner(file)
-						var pendingLine string
-						for scanner.Scan() {
-							line := scanner.Text()
-							if line == "" {
-								continue
-							}
-							if dpmlog.IsTabContinuation(line) && pendingLine != "" {
-								content := dpmlog.ExtractContinuationContent(line)
-								pendingLine += "\n" + content
-							} else {
-								if pendingLine != "" {
-									fmt.Fprintln(w, pendingLine)
-								}
-								pendingLine = line
-							}
-						}
-						if pendingLine != "" {
-							fmt.Fprintln(w, pendingLine)
-						}
-						positions[p] = info.Size()
-						file.Close()
-						if ok {
-							flusher.Flush()
-						}
-					}
-				}
-			}
-		}
 	}
 }
 
